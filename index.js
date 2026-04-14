@@ -1529,7 +1529,31 @@ io.on('connection', (socket) => {
     try {
       const { messageId, chatId, receiverId, content, mediaUrl, messageType, timestamp } = data;
 
-      // Deliver to receiver if online
+      // 1. Always queue message in MongoDB FIRST (Status: pending)
+      try {
+        const exists = await PendingMessage.findOne({ messageId });
+        if (!exists) {
+          const encryptedPayload = encryptMessageContent(content);
+          await new PendingMessage({
+            messageId,
+            senderId: userId,
+            receiverId,
+            chatId,
+            messageType: messageType || 'text',
+            content: encryptedPayload.content,
+            mediaUrl,
+            status: 'pending',
+            metadata: { enc: encryptedPayload.enc },
+          }).save();
+        }
+      } catch (dbErr) {
+        console.error('[Socket.IO] DB error early queuing message:', dbErr.message);
+      }
+
+      // 2. Notify sender that message is "pending" (queued on server)
+      socket.emit('message_status_update', { messageId, status: 'pending' });
+
+      // 3. Deliver real-time if online
       if (isUserOnline(receiverId)) {
         io.to(receiverId).emit('new_message', {
           messageId,
@@ -1541,47 +1565,18 @@ io.on('connection', (socket) => {
           messageType: messageType || 'text',
           timestamp: timestamp || Date.now(),
         });
-        // Notify sender of delivery
-        socket.emit('message_status_update', { messageId, status: 'delivered' });
-        console.log(`📤 [Socket.IO] Message ${messageId} delivered to online user ${receiverId}`);
+        console.log(`📤 [Socket.IO] Message ${messageId} emitted to online user ${receiverId}`);
       } else {
-        // Receiver is offline – store in MongoDB
-        try {
-          const exists = await PendingMessage.findOne({ messageId });
-          if (!exists) {
-            const encryptedPayload = encryptMessageContent(content);
-
-            await new PendingMessage({
-              messageId,
-              senderId: userId,
-              receiverId,
-              chatId,
-              messageType: messageType || 'text',
-              content: encryptedPayload.content,
-              mediaUrl,
-              status: 'pending',
-              metadata: {
-                enc: encryptedPayload.enc,
-              },
-            }).save();
-          }
-
-          // Receiver is offline in-app: trigger push notification so user sees it
-          // even when app socket is disconnected.
-          await sendNewMessagePushNotification({
-            receiverId,
-            senderId: userId,
-            chatId,
-            messageId,
-            messageType: messageType || 'text',
-            content,
-          });
-
-          socket.emit('message_status_update', { messageId, status: 'pending' });
-          console.log(`📦 [Socket.IO] Message ${messageId} queued for offline user ${receiverId}`);
-        } catch (dbErr) {
-          console.error('[Socket.IO] DB error queuing message:', dbErr.message);
-        }
+        // 4. Trigger push notification ONLY if offline
+        await sendNewMessagePushNotification({
+          receiverId,
+          senderId: userId,
+          chatId,
+          messageId,
+          messageType: messageType || 'text',
+          content,
+        });
+        console.log(`📦 [Socket.IO] Message ${messageId} queued for offline user ${receiverId}`);
       }
     } catch (err) {
       console.error('[Socket.IO] send_message error:', err);
