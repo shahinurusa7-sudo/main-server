@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# Firebase Admin SDK credentials (NEVER COMMIT!)
+serviceAccountKey.json
+*.json.backup
+
+# Environment variables
+.env
+.env.local
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Firebase service account key
+serviceAccountKey.json
+firebase-credentials.json
+*-firebase-adminsdk-*.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+coverage/
+.nyc_output/
+
+# Production
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
