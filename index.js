@@ -757,6 +757,11 @@ const normalizeUserWritePayload = (payload = {}) => {
     delete fields.location;
   }
 
+  // Convert empty emails to null to respect sparse unique index
+  if ('email' in fields && (!fields.email || fields.email.trim() === '')) {
+    fields.email = null;
+  }
+
   if (Array.isArray(fields.photos)) {
     fields.photos = asStringList(fields.photos);
   }
@@ -795,7 +800,7 @@ const serializeUser = (userDoc) => {
 
 const ensureMongoUserRecord = async ({
   uid,
-  email = '',
+  email = null,
   displayName = 'User',
   photoURL = '',
   isProfileComplete = false,
@@ -1078,6 +1083,7 @@ app.post('/api/auth/register', verifyToken, async (req, res) => {
     const displayName = String(
       req.body?.displayName || req.user.name || req.user.displayName || 'User'
     ).trim();
+    // Prioritize user upload, then Google picture only if nothing provided
     const photoURL = String(req.body?.photoURL || req.user.picture || '').trim();
 
     const userDoc = await ensureMongoUserRecord({
@@ -1114,7 +1120,13 @@ app.post('/api/auth/complete-profile', verifyToken, async (req, res) => {
       displayName: String(
         req.body?.displayName || existingUser?.displayName || req.user.name || 'User'
       ).trim(),
-      photoURL: String(req.body?.photoURL || existingUser?.photoURL || req.user.picture || '').trim(),
+      // Prioritize: if user uploads new pic use it, otherwise keep database pic, only fallback to Google if absolutely no pic exists
+      photoURL: String(
+        req.body?.photoURL || 
+        existingUser?.photoURL || 
+        (req.user.picture && !existingUser?.photoURL ? req.user.picture : '') || 
+        ''
+      ).trim(),
     };
 
     const fieldsToUpdate = normalizeUserWritePayload(mergedData);
@@ -3139,234 +3151,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── disconnect ──────────────────────────────────────────────
-  socket.on('disconnect', () => {
-    const sockets = onlineUsers.get(userId);
-    if (sockets) {
-      sockets.delete(socket.id);
-      if (sockets.size === 0) {
-        onlineUsers.delete(userId);
-        User.updateOne(
-          { uid: userId },
-          {
-            $set: {
-              online: false,
-              lastSeen: new Date(),
-              lastActive: new Date(),
-            },
-          }
-        ).catch((error) => {
-          console.error(`❌ Failed to persist offline presence for ${userId}:`, error.message);
-        });
-        socket.broadcast.emit('presence_update', {
-          userId,
-          status: 'offline',
-          lastSeen: Date.now(),
-        });
-      }
-    }
-    
-    // Handle video call disconnection
-    terminateVideoPair(socket, {
-      partnerReason: 'partner_disconnected',
-      emitSelf: false,
-    });
-    
-    // Remove from waiting queues
-    maleQueue.delete(socket.id);
-    femaleQueue.delete(socket.id);
-    
-    console.log(`📴 [Socket.IO] User disconnected: ${userId} (${socket.id})`);
-  });
-});
-
-// ==================== WEBRTC VIDEO MATCHING ====================
-// Track waiting users by gender for opposite-gender matching
-const maleQueue = new Map(); // socketId -> { userId, gender, socketId }
-const femaleQueue = new Map();
-const videoCallPairs = new Map(); // socketId -> partnerId
-
-// STUN server configuration (Google's free STUN servers)
-const ICE_SERVERS = [
-  { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' }
-];
-
-const removeSocketFromVideoQueues = (socketId) => {
-  maleQueue.delete(socketId);
-  femaleQueue.delete(socketId);
-};
-
-const terminateVideoPair = (
-  socket,
-  {
-    partnerReason = 'partner_ended',
-    selfReason = 'ended',
-    emitSelf = true,
-  } = {},
-) => {
-  const socketId = socket.id;
-  if (!videoCallPairs.has(socketId)) {
-    return null;
-  }
-
-  const partnerSocketId = videoCallPairs.get(socketId);
-  videoCallPairs.delete(socketId);
-
-  if (partnerSocketId) {
-    videoCallPairs.delete(partnerSocketId);
-    io.to(partnerSocketId).emit('video_call_ended', { reason: partnerReason });
-  }
-
-  if (emitSelf) {
-    socket.emit('video_call_ended', { reason: selfReason });
-  }
-
-  return partnerSocketId;
-};
-
-const findNextValidPartner = (oppositeQueue, currentSocketId) => {
-  while (oppositeQueue.size > 0) {
-    const [partnerSocketId, partnerInfo] = oppositeQueue.entries().next().value;
-    oppositeQueue.delete(partnerSocketId);
-
-    if (partnerSocketId === currentSocketId) {
-      continue;
-    }
-
-    const partnerSocket = io.sockets.sockets.get(partnerSocketId);
-    if (!partnerSocket || !partnerSocket.connected) {
-      continue;
-    }
-
-    if (videoCallPairs.has(partnerSocketId)) {
-      continue;
-    }
-
-    return { partnerSocketId, partnerInfo, partnerSocket };
-  }
-
-  return null;
-};
-
-const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
-  const userId = socket.userId;
-
-  if (!userId) {
-    socket.emit('video_match_error', { error: 'User not authenticated' });
-    return;
-  }
-
-  // Prevent duplicate queue entries for the same socket.
-  removeSocketFromVideoQueues(socket.id);
-
-  let gender = null;
-  let userDoc = null;
-
-  // Fetch the user profile from MongoDB to check status and gender
-  try {
-    userDoc = await User.findOne({ uid: userId }).select('gender isProfileComplete verified').lean();
-  } catch (mongoError) {
-    console.warn(`⚠️ [VideoMatch] Failed to fetch user profile for ${userId}: ${mongoError.message}`);
-  }
-
-  // Verify profile is complete or verified to participate in video matching
-  if (!userDoc) {
-    socket.emit('video_match_error', { 
-      error: 'User profile not found in database' 
-    });
-    console.error(`❌ [VideoMatch] User ${userId} not found in database`);
-    return;
-  }
-
-  if (!userDoc.isProfileComplete && !userDoc.verified) {
-    socket.emit('video_match_error', { 
-      error: 'Profile incomplete or not verified. Please complete your profile to use video matching.' 
-    });
-    console.log(`ℹ️ [VideoMatch] Blocked incomplete/unverified user ${userId}`);
-    return;
-  }
-
-  // Normalize gender: try client-provided first, then fall back to MongoDB
-  if (clientProvidedGender) {
-    gender = User.normalizeGender(clientProvidedGender);
-  }
-  
-  if (!gender && userDoc?.gender) {
-    gender = User.normalizeGender(userDoc.gender);
-    console.log(`ℹ️ [VideoMatch] Fetched gender from MongoDB for user ${userId}: ${gender}`);
-  }
-  
-  if (!gender) {
-    socket.emit('video_match_error', { 
-      error: 'Gender must be set to Male or Female to use video matching' 
-    });
-    console.error(`❌ [VideoMatch] No valid gender for user ${userId}`);
-    return;
-  }
-
-  // Only allow 'male' and 'female' for opposite-gender matching
-  if (!['male', 'female'].includes(gender)) {
-    socket.emit('video_match_error', {
-      error: 'Gender must be set to Male or Female to use video matching'
-    });
-    console.error(`❌ [VideoMatch] Invalid gender for ${userId}: ${gender}`);
-    return;
-  }
-
-  console.log(`🎥 [VideoMatch] ${userId} (${gender}) looking for match...`);
-
-  const userInfo = { userId, gender, socketId: socket.id };
-
-  // Determine which queues to use for matching
-  const myQueue = gender === 'male' ? maleQueue : femaleQueue;
-  const oppositeQueue = gender === 'male' ? femaleQueue : maleQueue;
-
-  const partner = findNextValidPartner(oppositeQueue, socket.id);
-
-  if (partner) {
-    // Create pair
-    videoCallPairs.set(socket.id, partner.partnerSocketId);
-    videoCallPairs.set(partner.partnerSocketId, socket.id);
-
-    // Remove both from queues
-    maleQueue.delete(socket.id);
-    femaleQueue.delete(socket.id);
-    maleQueue.delete(partner.partnerSocketId);
-    femaleQueue.delete(partner.partnerSocketId);
-
-    // Send ICE servers and match info to both parties
-    socket.emit('video_match_found', {
-      partnerId: partner.partnerInfo.userId,
-      partnerSocketId: partner.partnerSocketId,
-      iceServers: ICE_SERVERS,
-      isInitiator: true // This user initiates the call
-    });
-
-    io.to(partner.partnerSocketId).emit('video_match_found', {
-      partnerId: userId,
-      partnerSocketId: socket.id,
-      iceServers: ICE_SERVERS,
-      isInitiator: false // This user receives the call
-    });
-
-    console.log(`✅ [VideoMatch] Matched ${userId} (${gender}) with ${partner.partnerInfo.userId} (${partner.partnerInfo.gender})`);
-  } else {
-    // No match available, add to queue
-    myQueue.set(socket.id, userInfo);
-    socket.emit('video_match_waiting', {
-      message: 'Searching for a match...',
-      queuePosition: myQueue.size
-    });
-    console.log(`⏳ [VideoMatch] ${userId} (${gender}) added to queue (${myQueue.size} waiting)`);
-  }
-};
-
-io.on('connection', (socket) => {
-  
   // ── video_match_start: Join queue for random video matching ──
   socket.on('video_match_start', async (data) => {
     try {
@@ -3503,8 +3287,227 @@ io.on('connection', (socket) => {
       console.log(`📴 [VideoMatch] ${socket.userId} ended video call`);
     }
   });
-  
+
+  // ── disconnect ──────────────────────────────────────────────
+  socket.on('disconnect', () => {
+    const sockets = onlineUsers.get(userId);
+    if (sockets) {
+      sockets.delete(socket.id);
+      if (sockets.size === 0) {
+        onlineUsers.delete(userId);
+        User.updateOne(
+          { uid: userId },
+          {
+            $set: {
+              online: false,
+              lastSeen: new Date(),
+              lastActive: new Date(),
+            },
+          }
+        ).catch((error) => {
+          console.error(`❌ Failed to persist offline presence for ${userId}:`, error.message);
+        });
+        socket.broadcast.emit('presence_update', {
+          userId,
+          status: 'offline',
+          lastSeen: Date.now(),
+        });
+      }
+    }
+    
+    // Handle video call disconnection
+    terminateVideoPair(socket, {
+      partnerReason: 'partner_disconnected',
+      emitSelf: false,
+    });
+    
+    // Remove from waiting queues
+    maleQueue.delete(socket.id);
+    femaleQueue.delete(socket.id);
+    
+    console.log(`📴 [Socket.IO] User disconnected: ${userId} (${socket.id})`);
+  });
 });
+
+// ==================== WEBRTC VIDEO MATCHING ====================
+// Track waiting users by gender for opposite-gender matching
+const maleQueue = new Map(); // socketId -> { userId, gender, socketId }
+const femaleQueue = new Map();
+const videoCallPairs = new Map(); // socketId -> partnerId
+
+// STUN server configuration (Google's free STUN servers)
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' }
+];
+
+const removeSocketFromVideoQueues = (socketId) => {
+  maleQueue.delete(socketId);
+  femaleQueue.delete(socketId);
+};
+
+const terminateVideoPair = (
+  socket,
+  {
+    partnerReason = 'partner_ended',
+    selfReason = 'ended',
+    emitSelf = true,
+  } = {},
+) => {
+  const socketId = socket.id;
+  if (!videoCallPairs.has(socketId)) {
+    return null;
+  }
+
+  const partnerSocketId = videoCallPairs.get(socketId);
+  videoCallPairs.delete(socketId);
+
+  if (partnerSocketId) {
+    videoCallPairs.delete(partnerSocketId);
+    io.to(partnerSocketId).emit('video_call_ended', { reason: partnerReason });
+  }
+
+  if (emitSelf) {
+    socket.emit('video_call_ended', { reason: selfReason });
+  }
+
+  return partnerSocketId;
+};
+
+const findNextValidPartner = (oppositeQueue, currentSocketId) => {
+  while (oppositeQueue.size > 0) {
+    const [partnerSocketId, partnerInfo] = oppositeQueue.entries().next().value;
+    oppositeQueue.delete(partnerSocketId);
+
+    if (partnerSocketId === currentSocketId) {
+      continue;
+    }
+
+    const partnerSocket = io.sockets.sockets.get(partnerSocketId);
+    if (!partnerSocket || !partnerSocket.connected) {
+      continue;
+    }
+
+    if (videoCallPairs.has(partnerSocketId)) {
+      continue;
+    }
+
+    return { partnerSocketId, partnerInfo, partnerSocket };
+  }
+
+  return null;
+};
+
+const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
+  const userId = socket.userId;
+
+  if (!userId) {
+    socket.emit('video_match_error', { error: 'User not authenticated' });
+    return;
+  }
+
+  // Prevent duplicate queue entries for the same socket.
+  removeSocketFromVideoQueues(socket.id);
+
+  let gender = null;
+  let userDoc = null;
+
+  // Fetch the user profile from MongoDB to check status and gender
+  try {
+    userDoc = await User.findOne({ uid: userId }).select('gender isProfileComplete verified').lean();
+  } catch (mongoError) {
+    console.warn(`⚠️ [VideoMatch] Failed to fetch user profile for ${userId}: ${mongoError.message}`);
+  }
+
+  // Verify profile exists (may be incomplete)
+  if (!userDoc) {
+    socket.emit('video_match_error', { 
+      error: 'User profile not found in database' 
+    });
+    console.error(`❌ [VideoMatch] User ${userId} not found in database`);
+    return;
+  }
+
+  // No profile completion requirement - incomplete profiles can join video matching
+  // Gender will still be validated below
+
+  // Normalize gender: try client-provided first, then fall back to MongoDB
+  if (clientProvidedGender) {
+    gender = User.normalizeGender(clientProvidedGender);
+  }
+  
+  if (!gender && userDoc?.gender) {
+    gender = User.normalizeGender(userDoc.gender);
+    console.log(`ℹ️ [VideoMatch] Fetched gender from MongoDB for user ${userId}: ${gender}`);
+  }
+  
+  if (!gender) {
+    socket.emit('video_match_error', { 
+      error: 'Gender must be set to Male or Female to use video matching' 
+    });
+    console.error(`❌ [VideoMatch] No valid gender for user ${userId}`);
+    return;
+  }
+
+  // Only allow 'male' and 'female' for opposite-gender matching
+  if (!['male', 'female'].includes(gender)) {
+    socket.emit('video_match_error', {
+      error: 'Gender must be set to Male or Female to use video matching'
+    });
+    console.error(`❌ [VideoMatch] Invalid gender for ${userId}: ${gender}`);
+    return;
+  }
+
+  console.log(`🎥 [VideoMatch] ${userId} (${gender}) looking for match...`);
+
+  const userInfo = { userId, gender, socketId: socket.id };
+
+  // Determine which queues to use for matching
+  const myQueue = gender === 'male' ? maleQueue : femaleQueue;
+  const oppositeQueue = gender === 'male' ? femaleQueue : maleQueue;
+
+  const partner = findNextValidPartner(oppositeQueue, socket.id);
+
+  if (partner) {
+    // Create pair
+    videoCallPairs.set(socket.id, partner.partnerSocketId);
+    videoCallPairs.set(partner.partnerSocketId, socket.id);
+
+    // Remove both from queues
+    maleQueue.delete(socket.id);
+    femaleQueue.delete(socket.id);
+    maleQueue.delete(partner.partnerSocketId);
+    femaleQueue.delete(partner.partnerSocketId);
+
+    // Send ICE servers and match info to both parties
+    socket.emit('video_match_found', {
+      partnerId: partner.partnerInfo.userId,
+      partnerSocketId: partner.partnerSocketId,
+      iceServers: ICE_SERVERS,
+      isInitiator: true // This user initiates the call
+    });
+
+    io.to(partner.partnerSocketId).emit('video_match_found', {
+      partnerId: userId,
+      partnerSocketId: socket.id,
+      iceServers: ICE_SERVERS,
+      isInitiator: false // This user receives the call
+    });
+
+    console.log(`✅ [VideoMatch] Matched ${userId} (${gender}) with ${partner.partnerInfo.userId} (${partner.partnerInfo.gender})`);
+  } else {
+    // No match available, add to queue
+    myQueue.set(socket.id, userInfo);
+    socket.emit('video_match_waiting', {
+      message: 'Searching for a match...',
+      queuePosition: myQueue.size
+    });
+    console.log(`⏳ [VideoMatch] ${userId} (${gender}) added to queue (${myQueue.size} waiting)`);
+  }
+};
 
 // Bind on 0.0.0.0 so physical devices on the same WiFi can connect
 httpServer.listen(PORT, '0.0.0.0', () => {
