@@ -14,6 +14,13 @@ const bodyParser = require('body-parser');
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const PendingMessage = require('./models/PendingMessage');
+const User = require('./models/User');
+const Like = require('./models/Like');
+const Match = require('./models/Match');
+const ProfileView = require('./models/ProfileView');
+const Status = require('./models/Status');
+const Ad = require('./models/Ad');
+const Analytics = require('./models/Analytics');
 const packageJson = require('./package.json');
 
 // Initialize Express App
@@ -215,8 +222,8 @@ const buildWelcomeEmail = ({ userName }) => {
   const html = `
   <div style="background:#f3f6fb;padding:28px 12px;font-family:Segoe UI,Arial,sans-serif;color:#1e293b;">
     <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #dbe3ef;">
-      <div style="padding:28px 30px;background:linear-gradient(120deg,#0f766e,#0f172a);color:#ffffff;">
-        <h1 style="margin:0;font-size:24px;line-height:1.2;">Welcome to ${safeCompany}</h1>
+      <div style="padding:28px 30px;background:linear-gradient(120deg,#E92163,#FF6B9D);color:#ffffff;">
+        <h1 style="margin:0;font-size:24px;line-height:1.2;">Welcome to ${safeCompany} 💕</h1>
         <p style="margin:10px 0 0 0;font-size:14px;opacity:.92;">We are delighted to have you with us.</p>
       </div>
       <div style="padding:28px 30px;">
@@ -228,7 +235,7 @@ const buildWelcomeEmail = ({ userName }) => {
         <p style="margin:0 0 18px 0;font-size:15px;line-height:1.7;">
           If you need any assistance, our team is here to support you.
         </p>
-        <a href="${safeLoginUrl}" style="display:inline-block;background:#0f766e;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:600;font-size:14px;">Open ${safeCompany}</a>
+        <a href="${safeLoginUrl}" style="display:inline-block;background:#E92163;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:8px;font-weight:600;font-size:14px;">Open ${safeCompany}</a>
         <div style="margin-top:24px;padding-top:18px;border-top:1px solid #e2e8f0;">
           <p style="margin:0 0 6px 0;font-size:15px;">Warm regards,</p>
           <p style="margin:0;font-size:15px;font-weight:700;">${safeCeoName}</p>
@@ -288,37 +295,55 @@ const maybeSendWelcomeEmailForUser = async ({ userId, fallbackEmail = '' }) => {
     return { status: 'disabled' };
   }
 
-  const userRef = db.collection('users').doc(userId);
   let candidate = null;
   let firestoreData = null;
 
-  await db.runTransaction(async (tx) => {
-    const snap = await tx.get(userRef);
-    if (!snap.exists) {
-      return;
+  const userDoc = await User.findOneAndUpdate(
+    {
+      uid: userId,
+      welcomeEmailSentAt: null,
+      welcomeEmailLockAt: null,
+    },
+    {
+      $set: {
+        welcomeEmailLockAt: new Date(),
+      },
+    },
+    {
+      new: true,
     }
+  ).lean();
 
-    const data = snap.data() || {};
-    firestoreData = data;
-    if (data.welcomeEmailSentAt || data.welcomeEmailLockAt) {
-      return;
+  if (!userDoc) {
+    return { status: 'skipped' };
+  }
+
+  firestoreData = userDoc;
+
+  const email = String(userDoc.email || fallbackEmail || '').trim();
+  if (!email) {
+    await User.updateOne(
+      { uid: userId },
+      {
+        $unset: { welcomeEmailLockAt: 1 },
+      }
+    );
+    return { status: 'skipped' };
+  }
+
+  candidate = {
+    email,
+    userName: getDisplayNameFromUserData(userDoc, email),
+  };
+
+  await User.updateOne(
+    { uid: userId },
+    {
+      $set: {
+        welcomeEmailRecipient: email,
+      },
     }
-
-    const email = String(data.email || fallbackEmail || '').trim();
-    if (!email) {
-      return;
-    }
-
-    candidate = {
-      email,
-      userName: getDisplayNameFromUserData(data, email),
-    };
-
-    tx.set(userRef, {
-      welcomeEmailLockAt: admin.firestore.FieldValue.serverTimestamp(),
-      welcomeEmailRecipient: email,
-    }, { merge: true });
-  });
+  );
 
   if (!candidate) {
     return { status: 'skipped' };
@@ -336,24 +361,32 @@ const maybeSendWelcomeEmailForUser = async ({ userId, fallbackEmail = '' }) => {
       userName,
     });
     if (result.sent) {
-      await userRef.set({
-        welcomeEmailSentAt: admin.firestore.FieldValue.serverTimestamp(),
-        welcomeEmailError: admin.firestore.FieldValue.delete(),
-        welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
-      }, { merge: true });
+      await User.updateOne(
+        { uid: userId },
+        {
+          $set: { welcomeEmailSentAt: new Date() },
+          $unset: { welcomeEmailError: 1, welcomeEmailLockAt: 1 },
+        }
+      );
       return { status: 'sent' };
     }
 
-    await userRef.set({
-      welcomeEmailError: result.reason || 'unknown',
-      welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
-    }, { merge: true });
+    await User.updateOne(
+      { uid: userId },
+      {
+        $set: { welcomeEmailError: result.reason || 'unknown' },
+        $unset: { welcomeEmailLockAt: 1 },
+      }
+    );
     return { status: 'failed', reason: result.reason || 'unknown' };
   } catch (error) {
-    await userRef.set({
-      welcomeEmailError: error.message,
-      welcomeEmailLockAt: admin.firestore.FieldValue.delete(),
-    }, { merge: true });
+    await User.updateOne(
+      { uid: userId },
+      {
+        $set: { welcomeEmailError: error.message },
+        $unset: { welcomeEmailLockAt: 1 },
+      }
+    );
 
     return { status: 'failed', reason: error.message };
   }
@@ -470,12 +503,11 @@ const sendNewMessagePushNotification = async ({
   if (!receiverId) return false;
 
   try {
-    const receiverDoc = await db.collection('users').doc(receiverId).get();
-    if (!receiverDoc.exists) {
+    const receiverData = await User.findOne({ uid: receiverId }).select('fcmToken').lean();
+    if (!receiverData) {
       return false;
     }
 
-    const receiverData = receiverDoc.data() || {};
     const fcmToken = receiverData.fcmToken;
     if (!fcmToken) {
       return false;
@@ -590,6 +622,279 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
 };
 
 connectMongoDB();
+
+const toPlainObject = (value) => {
+  if (!value) {
+    return null;
+  }
+  if (typeof value.toObject === 'function') {
+    return value.toObject();
+  }
+  return value;
+};
+
+const sanitizeMongoDoc = (value) => {
+  const plain = toPlainObject(value);
+  if (!plain) {
+    return null;
+  }
+
+  const { _id, __v, ...rest } = plain;
+  return rest;
+};
+
+const parseLimit = (value, fallback = 50, max = 200) => {
+  const parsed = parseInt(String(value || fallback), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(parsed, max);
+};
+
+const getMatchId = (user1Id, user2Id) => {
+  const sortedIds = [String(user1Id), String(user2Id)].sort();
+  return `${sortedIds[0]}_${sortedIds[1]}`;
+};
+
+const buildDefaultUserData = ({
+  uid,
+  email = '',
+  displayName = 'User',
+  photoURL = '',
+  isProfileComplete = false,
+} = {}) => ({
+  uid,
+  email,
+  displayName,
+  photoURL,
+  photos: [],
+  phone: '',
+  phoneVerified: false,
+  authProvider: 'google',
+  gender: '',
+  dob: '',
+  age: 18,
+  bio: '',
+  location: {
+    country: '',
+    state: '',
+    city: '',
+    coordinates: null,
+  },
+  interests: [],
+  languages: [],
+  lifestyle: {},
+  height: '',
+  hairColor: '',
+  eyeColor: '',
+  education: '',
+  job: '',
+  verified: false,
+  likedUsers: [],
+  likedBy: [],
+  matches: [],
+  contactInfo: {},
+  photoCaptions: {},
+  online: false,
+  lastSeen: null,
+  lastActive: new Date(),
+  profileViews: 0,
+  isProfileComplete,
+});
+
+const hasText = (value) => typeof value === 'string' && value.trim().length > 0;
+
+const asStringList = (value) => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => String(item || '').trim())
+    .filter((item) => item.length > 0);
+};
+
+const isProfileDataComplete = (data = {}) => {
+  const displayName = String(data.displayName || '').trim();
+  const gender = String(data.gender || '').trim();
+  const bio = String(data.bio || '').trim();
+  const photoURL = String(data.photoURL || '').trim();
+  const photos = asStringList(data.photos);
+  const interests = asStringList(data.interests);
+  const languages = asStringList(data.languages);
+  const location = data.location && typeof data.location === 'object' ? data.location : {};
+  const country = String(location.country || '').trim();
+  const city = String(location.city || '').trim();
+  const dob = data.dob;
+  const hasDob =
+    dob instanceof Date ||
+    (typeof dob === 'string' && dob.trim().length > 0) ||
+    (typeof dob === 'number' && Number.isFinite(dob));
+
+  return (
+    displayName.length > 0 &&
+    gender.length > 0 &&
+    hasDob &&
+    country.length > 0 &&
+    city.length > 0 &&
+    languages.length > 0 &&
+    interests.length >= 5 &&
+    bio.length > 0 &&
+    photoURL.length > 0 &&
+    photos.length >= 2
+  );
+};
+
+const normalizeUserWritePayload = (payload = {}) => {
+  const fields = { ...payload };
+  delete fields._id;
+  delete fields.__v;
+  delete fields.id;
+  delete fields.createdAt;
+  delete fields.updatedAt;
+
+  if (fields.location && typeof fields.location !== 'object') {
+    delete fields.location;
+  }
+
+  if (Array.isArray(fields.photos)) {
+    fields.photos = asStringList(fields.photos);
+  }
+  if (Array.isArray(fields.interests)) {
+    fields.interests = asStringList(fields.interests);
+  }
+  if (Array.isArray(fields.languages)) {
+    fields.languages = asStringList(fields.languages);
+  }
+  if (Array.isArray(fields.likedUsers)) {
+    fields.likedUsers = asStringList(fields.likedUsers);
+  }
+  if (Array.isArray(fields.likedBy)) {
+    fields.likedBy = asStringList(fields.likedBy);
+  }
+  if (Array.isArray(fields.matches)) {
+    fields.matches = asStringList(fields.matches);
+  }
+
+  fields.lastActive = new Date();
+
+  return fields;
+};
+
+const serializeUser = (userDoc) => {
+  const data = sanitizeMongoDoc(userDoc);
+  if (!data) {
+    return null;
+  }
+
+  return {
+    ...data,
+    uid: data.uid,
+  };
+};
+
+const ensureMongoUserRecord = async ({
+  uid,
+  email = '',
+  displayName = 'User',
+  photoURL = '',
+  isProfileComplete = false,
+  extra = {},
+} = {}) => {
+  const updateFields = normalizeUserWritePayload({
+    email,
+    displayName,
+    photoURL,
+    ...extra,
+    isProfileComplete,
+  });
+
+  // Build default data only for fields on insert (avoid conflicts with $set)
+  const defaultData = buildDefaultUserData({
+    uid,
+    email,
+    displayName,
+    photoURL,
+    isProfileComplete,
+  });
+
+  // Remove from $setOnInsert any fields that are in $set to avoid conflicts
+  const setOnInsertData = {};
+  for (const key in defaultData) {
+    if (!(key in updateFields)) {
+      setOnInsertData[key] = defaultData[key];
+    }
+  }
+
+  return User.findOneAndUpdate(
+    { uid },
+    {
+      $setOnInsert: setOnInsertData,
+      $set: updateFields,
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
+};
+
+const ensureActiveMatch = async (user1Id, user2Id) => {
+  const matchId = getMatchId(user1Id, user2Id);
+  const participants = [user1Id, user2Id].sort();
+
+  await Match.findOneAndUpdate(
+    { matchId },
+    {
+      $set: {
+        user1Id: participants[0],
+        user2Id: participants[1],
+        participants,
+        status: 'active',
+        deletedAt: null,
+        timestamp: new Date(),
+      },
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true,
+    }
+  );
+
+  await Promise.all([
+    User.updateOne(
+      { uid: user1Id },
+      {
+        $addToSet: { matches: user2Id },
+      }
+    ),
+    User.updateOne(
+      { uid: user2Id },
+      {
+        $addToSet: { matches: user1Id },
+      }
+    ),
+  ]);
+
+  return matchId;
+};
+
+const getPresencePayload = async (userId) => {
+  const userDoc = await User.findOne({ uid: userId }).lean();
+  const isOnline = isUserOnline(userId) || userDoc?.online === true;
+  const lastSeen =
+    userDoc?.lastSeen instanceof Date
+      ? userDoc.lastSeen.toISOString()
+      : userDoc?.lastSeen || null;
+
+  return {
+    userId,
+    status: isOnline ? 'online' : 'offline',
+    lastSeen,
+  };
+};
 
 // Middleware to verify Firebase token
 const verifyToken = async (req, res, next) => {
@@ -716,281 +1021,991 @@ app.get('/api/firestore-test', async (req, res) => {
   }
 });
 
-// ==================== WEB APP VERIFICATION ====================
+// ==================== MONGODB DATA ROUTES ====================
 
-/**
- * Verify if user account exists in Firestore
- * Used by web app to check if Google-signed user has created account via mobile
- */
 app.get('/api/verify-account', verifyToken, async (req, res) => {
   try {
     const userId = req.user.uid;
-    const email = req.user.email;
+    const email = req.user.email || '';
+    const userDoc = await User.findOne({ uid: userId }).lean();
 
-    console.log(`\n🔍 ===== ACCOUNT VERIFICATION REQUEST =====`);
-    console.log(`   User ID (UID): ${userId}`);
-    console.log(`   Email: ${email}`);
-    console.log(`   Looking in Firestore: users/${userId}`);
-
-    // Check if user exists in Firestore
-    const userDoc = await db.collection('users').doc(userId).get();
-
-    console.log(`   Document exists: ${userDoc.exists}`);
-
-    if (!userDoc.exists) {
-      console.log(`❌ Account not found for user: ${userId}`);
-      console.log(`   Tip: Check if document exists at: Firestore > users > ${userId}`);
-      console.log(`========================================\n`);
+    if (!userDoc) {
       return res.json({
         exists: false,
-        message: `Account not found. Please create an account using the mobile app.\n\nUser ID: ${userId}\nEmail: ${email}`
+        message: `Account not found. Please create an account using the mobile app.\n\nUser ID: ${userId}\nEmail: ${email}`,
       });
     }
 
-    const userData = userDoc.data();
-    console.log(`   User data found:`, JSON.stringify(userData, null, 2));
-
-    // Fire-and-forget welcome email for first-time backend-verified users.
     maybeSendWelcomeEmailForUser({
       userId,
       fallbackEmail: email,
-    }).then((result) => {
-      if (result.status === 'sent') {
-        console.log(`📧 Welcome email sent to ${email} for ${userId}`);
-      } else if (result.status === 'failed') {
-        console.warn(`⚠️ Welcome email failed for ${userId}: ${result.reason}`);
-      }
     }).catch((e) => {
       console.warn(`⚠️ Welcome email pipeline error for ${userId}: ${e.message}`);
     });
 
-    // Verify email matches (optional additional check)
-    if (userData.email && userData.email !== email) {
-      console.log(`⚠️  Email mismatch for user: ${userId}`);
-      console.log(`   Firestore email: ${userData.email}`);
-      console.log(`   Google email: ${email}`);
-      console.log(`========================================\n`);
+    if (userDoc.email && email && userDoc.email !== email) {
       return res.json({
         exists: false,
-        message: `Email mismatch.\n\nFirestore: ${userData.email}\nGoogle: ${email}\n\nPlease use the correct Google account.`
+        message: `Email mismatch.\n\nMongoDB: ${userDoc.email}\nGoogle: ${email}\n\nPlease use the correct Google account.`,
       });
     }
 
-    console.log(`✅ Account verified successfully for user: ${userId}`);
-    console.log(`========================================\n`);
-    
-    res.json({
+    return res.json({
       exists: true,
       user: {
         id: userId,
-        email: email,
-        name: userData.name || userData.displayName,
-        photoURL: userData.photoURL,
-        gender: userData.gender,
-        createdAt: userData.createdAt
-      }
+        email,
+        name: userDoc.name || userDoc.displayName,
+        photoURL: userDoc.photoURL,
+        gender: userDoc.gender,
+        createdAt: userDoc.createdAt,
+      },
     });
-
   } catch (error) {
-    console.error('❌ Error verifying account:', error);
-    console.error('   Error details:', error.message);
-    console.error('   Stack trace:', error.stack);
-    console.log(`========================================\n`);
-    res.status(500).json({
+    console.error('❌ Error verifying account (MongoDB route):', error);
+    return res.status(500).json({
       exists: false,
       error: 'Internal server error',
-      message: `Failed to verify account: ${error.message}`
+      message: `Failed to verify account: ${error.message}`,
     });
   }
 });
 
-// ==================== USER ROUTES ====================
-
-// Get user profile
-app.get('/api/users/:userId', verifyToken, async (req, res) => {
+app.post('/api/auth/register', verifyToken, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const requestingUserId = req.user.uid;
+    const userId = req.user.uid;
+    const email = String(req.body?.email || req.user.email || '').trim();
+    const displayName = String(
+      req.body?.displayName || req.user.name || req.user.displayName || 'User'
+    ).trim();
+    const photoURL = String(req.body?.photoURL || req.user.picture || '').trim();
 
-    console.log(`\n📋 ===== GET USER PROFILE =====`);
-    console.log(`   Requesting user: ${requestingUserId}`);
-    console.log(`   Target user: ${userId}`);
+    const userDoc = await ensureMongoUserRecord({
+      uid: userId,
+      email,
+      displayName,
+      photoURL,
+      isProfileComplete: false,
+    });
 
-    // Validate userId format
-    if (!userId || userId.length === 0) {
-      return res.status(400).json({ 
-        success: false,
-        error: 'Invalid user ID',
-        message: 'User ID cannot be empty'
-      });
-    }
-
-    // Verify Firestore is initialized
-    if (!db) {
-      console.error('❌ Firestore not initialized');
-      return res.status(500).json({
-        success: false,
-        error: 'Database initialization failed',
-        message: 'Firestore database not initialized. Check Firebase Admin SDK setup.'
-      });
-    }
-
-    console.log(`🔍 Querying Firestore: users/${userId}`);
-    
-    // Get user from Firestore with error handling
-    let userDoc;
-    try {
-      userDoc = await db.collection('users').doc(userId).get();
-    } catch (firestoreError) {
-      console.error('❌ Firestore query failed:', firestoreError.message);
-      console.error('   Error code:', firestoreError.code);
-      
-      // Provide detailed error response
-      if (firestoreError.code === 'UNAUTHENTICATED') {
-        return res.status(500).json({
-          success: false,
-          error: 'Firestore authentication failed',
-          message: 'Admin SDK cannot authenticate with Firestore. Check serviceAccountKey.json and IAM permissions.',
-          details: {
-            code: firestoreError.code,
-            suggestion: 'Verify that: 1) Firestore API is enabled in Google Cloud Console, 2) Service account has Editor role, 3) Project ID matches in serviceAccountKey.json'
-          }
-        });
-      } else if (firestoreError.code === 'PERMISSION_DENIED') {
-        return res.status(403).json({
-          success: false,
-          error: 'Permission denied',
-          message: 'Service account lacks permission to read this collection.',
-          details: {
-            code: firestoreError.code,
-            suggestion: 'Ensure service account has "Editor" or "Cloud Datastore Owner" role in Firebase Console.'
-          }
-        });
-      }
-      
-      throw firestoreError; // Re-throw for generic error handler
-    }
-
-    if (!userDoc.exists) {
-      console.log(`⚠️  User document not found: ${userId}`);
-      return res.status(404).json({ 
-        success: false,
-        error: 'User not found',
-        message: `User profile not found for ID: ${userId}`
-      });
-    }
-
-    const userData = userDoc.data();
-    console.log(`✅ User found: ${userData.displayName || 'Unknown'}`);
-
-    res.json({
+    return res.json({
       success: true,
-      data: {
-        id: userDoc.id,
-        ...userData
-      }
+      data: serializeUser(userDoc),
     });
   } catch (error) {
-    console.error('❌ Error in GET /api/users/:userId:', error.message);
-    console.error('   Full error:', error);
-    
-    res.status(500).json({
+    console.error('❌ Error in POST /api/auth/register:', error);
+    return res.status(500).json({
       success: false,
-      error: 'Internal server error',
+      error: 'Failed to register user',
       message: error.message,
-      code: error.code || 'UNKNOWN'
     });
   }
 });
 
-// Update user profile
-app.put('/api/users/:userId', verifyToken, async (req, res) => {
+app.post('/api/auth/complete-profile', verifyToken, async (req, res) => {
   try {
-    const { userId } = req.params;
-    const updates = req.body;
-    const requestingUserId = req.user.uid;
+    const userId = req.user.uid;
+    const existingUser = await User.findOne({ uid: userId }).lean();
+    const mergedData = {
+      ...(existingUser || buildDefaultUserData({ uid: userId })),
+      ...req.body,
+      uid: userId,
+      email: String(req.body?.email || existingUser?.email || req.user.email || '').trim(),
+      displayName: String(
+        req.body?.displayName || existingUser?.displayName || req.user.name || 'User'
+      ).trim(),
+      photoURL: String(req.body?.photoURL || existingUser?.photoURL || req.user.picture || '').trim(),
+    };
 
-    console.log(`\n✏️  ===== UPDATE USER PROFILE =====`);
-    console.log(`   Requesting user: ${requestingUserId}`);
-    console.log(`   Target user: ${userId}`);
-    console.log(`   Fields to update:`, Object.keys(updates));
+    const fieldsToUpdate = normalizeUserWritePayload(mergedData);
+    fieldsToUpdate.isProfileComplete = true;
 
-    // Verify user is updating their own profile
-    if (requestingUserId !== userId) {
-      console.log(`⚠️  Authorization check failed: ${requestingUserId} != ${userId}`);
-      return res.status(403).json({ 
-        success: false,
-        error: 'Unauthorized',
-        message: 'You can only update your own profile'
-      });
+    // Build default data only for fields on insert (avoid conflicts with $set)
+    const defaultData = buildDefaultUserData({
+      uid: userId,
+      email: fieldsToUpdate.email,
+      displayName: fieldsToUpdate.displayName,
+      photoURL: fieldsToUpdate.photoURL,
+      isProfileComplete: true,
+    });
+
+    // Remove from $setOnInsert any fields that are in $set to avoid conflicts
+    const setOnInsertData = {};
+    for (const key in defaultData) {
+      if (!(key in fieldsToUpdate)) {
+        setOnInsertData[key] = defaultData[key];
+      }
     }
 
-    // Validate updates object
-    if (!updates || Object.keys(updates).length === 0) {
+    const userDoc = await User.findOneAndUpdate(
+      { uid: userId },
+      {
+        $setOnInsert: setOnInsertData,
+        $set: fieldsToUpdate,
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    const welcomeResult = await maybeSendWelcomeEmailForUser({
+      userId,
+      fallbackEmail: fieldsToUpdate.email,
+    });
+
+    return res.json({
+      success: true,
+      data: serializeUser(userDoc),
+      welcomeEmail: welcomeResult,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/auth/complete-profile:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to complete profile',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users', verifyToken, async (req, res) => {
+  try {
+    const limit = parseLimit(req.query.limit, 200, 500);
+    const gender = hasText(req.query.gender) ? String(req.query.gender).trim() : null;
+    const minAge = Number.isFinite(Number(req.query.minAge)) ? Number(req.query.minAge) : null;
+    const maxAge = Number.isFinite(Number(req.query.maxAge)) ? Number(req.query.maxAge) : null;
+    const excludeUserId = hasText(req.query.excludeUserId)
+      ? String(req.query.excludeUserId).trim()
+      : null;
+    const ids = hasText(req.query.ids)
+      ? String(req.query.ids)
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : [];
+
+    const query = {};
+
+    if (ids.length > 0) {
+      query.uid = { $in: ids };
+    }
+    if (gender) {
+      query.gender = gender;
+    }
+    if (minAge !== null || maxAge !== null) {
+      query.age = {};
+      if (minAge !== null) {
+        query.age.$gte = minAge;
+      }
+      if (maxAge !== null) {
+        query.age.$lte = maxAge;
+      }
+    }
+    if (excludeUserId) {
+      query.uid = query.uid
+        ? { ...query.uid, $nin: [excludeUserId] }
+        : { $ne: excludeUserId };
+    }
+
+    const users = await User.find(query)
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const serialized = users.map((user) => serializeUser(user)).filter(Boolean);
+
+    return res.json({
+      success: true,
+      users: ids.length > 0
+        ? ids
+            .map((uid) => serialized.find((user) => user.uid === uid))
+            .filter(Boolean)
+        : serialized,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch users',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/users/batch', verifyToken, async (req, res) => {
+  try {
+    const userIds = asStringList(req.body?.userIds);
+
+    if (userIds.length === 0) {
       return res.status(400).json({
         success: false,
         error: 'Invalid request',
-        message: 'No fields provided for update'
+        message: 'userIds is required',
       });
     }
 
-    // Prevent updating sensitive fields
-    const protectedFields = ['uid', 'createdAt', 'id'];
-    const fieldsToUpdate = { ...updates };
-    protectedFields.forEach(field => delete fieldsToUpdate[field]);
+    const users = await User.find({ uid: { $in: userIds } }).lean();
+    const serialized = users.map((user) => serializeUser(user)).filter(Boolean);
 
-    console.log(`✏️  Writing to Firestore: users/${userId}`);
+    return res.json({
+      success: true,
+      users: userIds
+        .map((uid) => serialized.find((user) => user.uid === uid))
+        .filter(Boolean),
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/batch:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch users',
+      message: error.message,
+    });
+  }
+});
 
-    try {
-      await db.collection('users').doc(userId).update({
-        ...fieldsToUpdate,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
-    } catch (firestoreError) {
-      console.error('❌ Firestore update failed:', firestoreError.message);
-      console.error('   Error code:', firestoreError.code);
-      
-      if (firestoreError.code === 'NOT_FOUND') {
-        return res.status(404).json({
-          success: false,
-          error: 'User not found',
-          message: `User profile does not exist for ID: ${userId}`
-        });
-      } else if (firestoreError.code === 'UNAUTHENTICATED') {
-        return res.status(500).json({
-          success: false,
-          error: 'Firestore authentication failed',
-          message: 'Admin SDK cannot authenticate with Firestore.',
-          details: { code: firestoreError.code }
-        });
-      }
-      
-      throw firestoreError;
+app.post('/api/users/presence/batch', verifyToken, async (req, res) => {
+  try {
+    const userIds = asStringList(req.body?.userIds);
+    const presence = {};
+
+    for (const userId of userIds) {
+      presence[userId] = await getPresencePayload(userId);
     }
 
-    console.log(`✅ User profile updated successfully`);
+    return res.json({
+      success: true,
+      presence,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/presence/batch:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch presence',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/users/:userId/view', verifyToken, async (req, res) => {
+  try {
+    const ownerUserId = req.params.userId;
+    const viewerId = req.user.uid;
+
+    if (!ownerUserId || ownerUserId === viewerId) {
+      return res.json({ success: true });
+    }
+
+    await Promise.all([
+      ProfileView.findOneAndUpdate(
+        { ownerUserId, viewerId },
+        {
+          $set: { viewedAt: new Date() },
+        },
+        {
+          upsert: true,
+          new: true,
+          setDefaultsOnInsert: true,
+        }
+      ),
+      User.updateOne(
+        { uid: ownerUserId },
+        {
+          $inc: { profileViews: 1 },
+          $set: { lastViewedAt: new Date() },
+        }
+      ),
+    ]);
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/:userId/view:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to track profile view',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users/:userId/views', verifyToken, async (req, res) => {
+  try {
+    const userDoc = await User.findOne({ uid: req.params.userId }).lean();
+    return res.json({
+      success: true,
+      count: userDoc?.profileViews || 0,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users/:userId/views:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to get profile views',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users/:userId/viewers', verifyToken, async (req, res) => {
+  try {
+    const limit = parseLimit(req.query.limit, 50, 200);
+    const ownerUserId = req.params.userId;
+    const viewerRows = await ProfileView.find({ ownerUserId })
+      .sort({ viewedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const viewerIds = viewerRows.map((row) => row.viewerId);
+    const viewerDocs = await User.find({ uid: { $in: viewerIds } }).lean();
+    const viewerMap = new Map(
+      viewerDocs.map((doc) => [doc.uid, serializeUser(doc)])
+    );
+
+    const viewers = viewerRows
+      .map((row) => {
+        const viewer = viewerMap.get(row.viewerId);
+        if (!viewer) {
+          return null;
+        }
+
+        return {
+          id: row.viewerId,
+          displayName: viewer.displayName || 'Unknown',
+          photoURL: viewer.photoURL || '',
+          age: viewer.age || 0,
+          verified: viewer.verified === true,
+          viewedAt: row.viewedAt,
+        };
+      })
+      .filter(Boolean);
+
+    return res.json({
+      success: true,
+      viewers,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users/:userId/viewers:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to get profile viewers',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users/:userId/presence', verifyToken, async (req, res) => {
+  try {
+    const payload = await getPresencePayload(req.params.userId);
+    return res.json({
+      success: true,
+      ...payload,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users/:userId/presence:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to get presence',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId || userId.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user ID',
+        message: 'User ID cannot be empty',
+      });
+    }
+
+    const userDoc = await User.findOne({ uid: userId }).lean();
+    if (!userDoc) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+        message: `User profile not found for ID: ${userId}`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: serializeUser(userDoc),
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users/:userId:', error.message);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message,
+      code: error.code || 'UNKNOWN',
+    });
+  }
+});
+
+app.put('/api/users/:userId', verifyToken, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const updates = req.body || {};
+
+    if (req.user.uid !== userId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'You can only update your own profile',
+      });
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid request',
+        message: 'No fields provided for update',
+      });
+    }
+
+    const existingUser = await User.findOne({ uid: userId }).lean();
+    if (!existingUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+        message: `User profile does not exist for ID: ${userId}`,
+      });
+    }
+
+    const mergedData = {
+      ...existingUser,
+      ...updates,
+      uid: userId,
+    };
+    const fieldsToUpdate = normalizeUserWritePayload(mergedData);
+    fieldsToUpdate.isProfileComplete =
+      updates.isProfileComplete === true ||
+      existingUser.isProfileComplete === true ||
+      isProfileDataComplete(mergedData);
+
+    const userDoc = await User.findOneAndUpdate(
+      { uid: userId },
+      { $set: fieldsToUpdate },
+      { new: true }
+    );
 
     const welcomeResult = await maybeSendWelcomeEmailForUser({
       userId,
       fallbackEmail: req.user.email || '',
     });
 
-    res.json({
+    return res.json({
       success: true,
       message: 'User profile updated successfully',
+      data: serializeUser(userDoc),
       welcomeEmail: welcomeResult,
     });
   } catch (error) {
     console.error('❌ Error in PUT /api/users/:userId:', error.message);
-    
-    res.status(500).json({ 
+    return res.status(500).json({
       success: false,
       error: 'Internal server error',
       message: error.message,
-      code: error.code || 'UNKNOWN'
+      code: error.code || 'UNKNOWN',
     });
   }
 });
+
+app.post('/api/likes', verifyToken, async (req, res) => {
+  try {
+    const fromUserId = req.user.uid;
+    const toUserId = String(req.body?.toUserId || '').trim();
+
+    if (!toUserId || toUserId === fromUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid target user',
+      });
+    }
+
+    const [fromUser, toUser] = await Promise.all([
+      User.findOne({ uid: fromUserId }).lean(),
+      User.findOne({ uid: toUserId }).lean(),
+    ]);
+
+    if (!fromUser || !toUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    const likeId = `${fromUserId}_${toUserId}`;
+    const likeDoc = await Like.findOneAndUpdate(
+      { likeId },
+      {
+        $setOnInsert: {
+          likeId,
+          fromUserId,
+          toUserId,
+          fromUserName: String(
+            req.body?.fromUserName || fromUser.displayName || req.user.name || 'User'
+          ).trim(),
+          fromUserPhoto: String(
+            req.body?.fromUserPhoto || fromUser.photoURL || req.user.picture || ''
+          ).trim(),
+          timestamp: new Date(),
+          isRead: false,
+        },
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    await Promise.all([
+      User.updateOne(
+        { uid: fromUserId },
+        { $addToSet: { likedUsers: toUserId } }
+      ),
+      User.updateOne(
+        { uid: toUserId },
+        { $addToSet: { likedBy: fromUserId } }
+      ),
+    ]);
+
+    const reciprocalLike = await Like.findOne({
+      likeId: `${toUserId}_${fromUserId}`,
+    }).lean();
+
+    let matchId = null;
+    if (reciprocalLike) {
+      matchId = await ensureActiveMatch(fromUserId, toUserId);
+    }
+
+    return res.json({
+      success: true,
+      like: sanitizeMongoDoc(likeDoc),
+      isMutual: !!reciprocalLike,
+      matchId,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/likes:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to send like',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/likes/received', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const limit = parseLimit(req.query.limit, 50, 200);
+    const likes = await Like.find({ toUserId: userId })
+      .sort({ timestamp: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      success: true,
+      likes: likes.map((like) => ({
+        ...sanitizeMongoDoc(like),
+        timestamp: like.timestamp instanceof Date
+          ? like.timestamp.toISOString()
+          : like.timestamp,
+      })),
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/likes/received:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch received likes',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/likes/status/:otherUserId', verifyToken, async (req, res) => {
+  try {
+    const currentUserId = req.user.uid;
+    const otherUserId = req.params.otherUserId;
+
+    const [directLike, reverseLike] = await Promise.all([
+      Like.findOne({ likeId: `${currentUserId}_${otherUserId}` }).lean(),
+      Like.findOne({ likeId: `${otherUserId}_${currentUserId}` }).lean(),
+    ]);
+
+    return res.json({
+      success: true,
+      liked: !!directLike,
+      mutual: !!directLike && !!reverseLike,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/likes/status/:otherUserId:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch like status',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/likes/read', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const fromUserId = String(req.body?.fromUserId || '').trim();
+
+    if (!fromUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'fromUserId is required',
+      });
+    }
+
+    await Like.updateOne(
+      { likeId: `${fromUserId}_${userId}` },
+      {
+        $set: {
+          isRead: true,
+          readAt: new Date(),
+        },
+      }
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error in POST /api/likes/read:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to mark like as read',
+      message: error.message,
+    });
+  }
+});
+
+app.delete('/api/likes/:otherUserId', verifyToken, async (req, res) => {
+  try {
+    const currentUserId = req.user.uid;
+    const otherUserId = req.params.otherUserId;
+
+    await Promise.all([
+      Like.deleteOne({ likeId: `${currentUserId}_${otherUserId}` }),
+      User.updateOne(
+        { uid: currentUserId },
+        { $pull: { likedUsers: otherUserId } }
+      ),
+      User.updateOne(
+        { uid: otherUserId },
+        { $pull: { likedBy: currentUserId } }
+      ),
+    ]);
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error in DELETE /api/likes/:otherUserId:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to unlike user',
+      message: error.message,
+    });
+  }
+});
+
+// ==================== BLOCK/UNBLOCK ENDPOINTS ====================
+
+app.post('/api/users/:uid/block/:targetUid', verifyToken, async (req, res) => {
+  try {
+    const blocker = req.user.uid;
+    const blocked = req.params.targetUid;
+
+    if (!blocked || blocked === blocker) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid target user',
+        message: 'Cannot block yourself',
+      });
+    }
+
+    const blockedUser = await User.findOne({ uid: blocked }).lean();
+    if (!blockedUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+        message: `User profile not found for ID: ${blocked}`,
+      });
+    }
+
+    // Add to blockedUsers array and add to their blockedBy array
+    await Promise.all([
+      User.updateOne(
+        { uid: blocker },
+        {
+          $addToSet: { blockedUsers: blocked },
+          // Also remove from matches and likes
+          $pull: {
+            likedUsers: blocked,
+            likedBy: blocked,
+            matches: blocked,
+          },
+        }
+      ),
+      User.updateOne(
+        { uid: blocked },
+        {
+          $addToSet: { blockedBy: blocker },
+          // Also remove from their matches and likes to blocked user
+          $pull: {
+            likedUsers: blocker,
+            likedBy: blocker,
+            matches: blocker,
+          },
+        }
+      ),
+      // Clean up like documents
+      Like.deleteMany({
+        $or: [
+          { likeId: `${blocker}_${blocked}` },
+          { likeId: `${blocked}_${blocker}` },
+        ],
+      }),
+      // Clean up match document
+      Match.deleteOne({
+        matchId: getMatchId(blocker, blocked),
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: `Successfully blocked user: ${blocked}`,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/:uid/block/:targetUid:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to block user',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/users/:uid/unblock/:targetUid', verifyToken, async (req, res) => {
+  try {
+    const unblocking = req.user.uid;
+    const toUnblock = req.params.targetUid;
+
+    if (!toUnblock || toUnblock === unblocking) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid target user',
+      });
+    }
+
+    const targetUser = await User.findOne({ uid: toUnblock }).lean();
+    if (!targetUser) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+        message: `User profile not found for ID: ${toUnblock}`,
+      });
+    }
+
+    // Remove from blockedUsers and blockedBy arrays
+    await Promise.all([
+      User.updateOne(
+        { uid: unblocking },
+        { $pull: { blockedUsers: toUnblock } }
+      ),
+      User.updateOne(
+        { uid: toUnblock },
+        { $pull: { blockedBy: unblocking } }
+      ),
+    ]);
+
+    return res.json({
+      success: true,
+      message: `Successfully unblocked user: ${toUnblock}`,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/:uid/unblock/:targetUid:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to unblock user',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/users/:uid/blocked', verifyToken, async (req, res) => {
+  try {
+    const userId = req.params.uid;
+    const limit = parseLimit(req.query.limit, 100, 300);
+
+    if (req.user.uid !== userId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Unauthorized',
+        message: 'You can only view your own blocked list',
+      });
+    }
+
+    const userDoc = await User.findOne({ uid: userId })
+      .select('blockedUsers')
+      .lean();
+
+    if (!userDoc) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    const blockedUserIds = (userDoc.blockedUsers || []).slice(0, limit);
+    const blockedUsers = await User.find({ uid: { $in: blockedUserIds } })
+      .select('uid displayName photoURL age gender verified')
+      .lean();
+
+    const serialized = blockedUsers.map((user) => ({
+      uid: user.uid,
+      displayName: user.displayName,
+      photoURL: user.photoURL,
+      age: user.age,
+      gender: user.gender,
+      verified: user.verified,
+    }));
+
+    return res.json({
+      success: true,
+      blockedUsers: serialized,
+      count: userDoc.blockedUsers?.length || 0,
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/users/:uid/blocked:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch blocked users',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/users/:uid/is-blocked/:targetUid', verifyToken, async (req, res) => {
+  try {
+    const userId = req.params.uid;
+    const targetUid = req.params.targetUid;
+
+    const userDoc = await User.findOne({ uid: userId })
+      .select('blockedUsers blockedBy')
+      .lean();
+
+    if (!userDoc) {
+      return res.status(404).json({
+        success: false,
+        error: 'User not found',
+      });
+    }
+
+    const isBlocked = (userDoc.blockedUsers || []).includes(targetUid);
+    const hasBlockedByTarget = (userDoc.blockedBy || []).includes(targetUid);
+
+    return res.json({
+      success: true,
+      blockedByMe: isBlocked,
+      blockedMe: hasBlockedByTarget,
+    });
+  } catch (error) {
+    console.error('❌ Error in POST /api/users/:uid/is-blocked/:targetUid:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to check block status',
+      message: error.message,
+    });
+  }
+});
+
+app.get('/api/matches', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const limit = parseLimit(req.query.limit, 100, 300);
+    const matches = await Match.find({
+      participants: userId,
+      status: 'active',
+    })
+      .sort({ updatedAt: -1, timestamp: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.json({
+      success: true,
+      matches: matches.map((match) => {
+        const partnerId =
+          match.user1Id === userId ? match.user2Id : match.user1Id;
+        return {
+          ...sanitizeMongoDoc(match),
+          partnerUserId: partnerId,
+        };
+      }),
+    });
+  } catch (error) {
+    console.error('❌ Error in GET /api/matches:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to fetch matches',
+      message: error.message,
+    });
+  }
+});
+
+app.post('/api/matches/unmatch', verifyToken, async (req, res) => {
+  try {
+    const currentUserId = req.user.uid;
+    const partnerUserId = String(req.body?.userId || '').trim();
+
+    if (!partnerUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'userId is required',
+      });
+    }
+
+    const matchId = getMatchId(currentUserId, partnerUserId);
+
+    await Promise.all([
+      Match.updateOne(
+        { matchId },
+        {
+          $set: {
+            status: 'deleted',
+            deletedAt: new Date(),
+          },
+        }
+      ),
+      User.updateOne(
+        { uid: currentUserId },
+        { $pull: { matches: partnerUserId } }
+      ),
+      User.updateOne(
+        { uid: partnerUserId },
+        { $pull: { matches: currentUserId } }
+      ),
+    ]);
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error in POST /api/matches/unmatch:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to unmatch user',
+      message: error.message,
+    });
+  }
+});
+
+// ==================== WEB APP VERIFICATION ====================
+
+// Redundant Firestore user routes removed. MongoDB versions at lines 1027-1516 are active.
+
 
 // ==================== NOTIFICATION ROUTES ====================
 
@@ -1302,26 +2317,18 @@ app.get('/api/messages/stats', verifyToken, async (req, res) => {
 // Get all users (admin only)
 app.get('/api/admin/users', verifyToken, async (req, res) => {
   try {
-    // Check if user is admin
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    if (!userDoc.exists || !userDoc.data().isAdmin) {
+    const adminUser = await User.findOne({ uid: req.user.uid }).lean();
+    if (!adminUser || !adminUser.isAdmin) {
       return res.status(403).json({ error: 'Unauthorized - Admin only' });
     }
 
-    const usersSnapshot = await db.collection('users').limit(100).get();
-    const users = [];
-
-    usersSnapshot.forEach(doc => {
-      users.push({
-        id: doc.id,
-        ...doc.data()
-      });
-    });
+    const users = await User.find({}).limit(100).sort({ createdAt: -1 }).lean();
+    const serialized = users.map(u => serializeUser(u));
 
     res.json({
       success: true,
-      data: users,
-      count: users.length
+      data: serialized,
+      count: serialized.length
     });
   } catch (error) {
     console.error('Error fetching users:', error);
@@ -1334,17 +2341,16 @@ app.delete('/api/admin/users/:userId', verifyToken, async (req, res) => {
   try {
     const { userId } = req.params;
 
-    // Check if user is admin
-    const userDoc = await db.collection('users').doc(req.user.uid).get();
-    if (!userDoc.exists || !userDoc.data().isAdmin) {
+    const adminUser = await User.findOne({ uid: req.user.uid }).lean();
+    if (!adminUser || !adminUser.isAdmin) {
       return res.status(403).json({ error: 'Unauthorized - Admin only' });
     }
 
     // Delete from Firebase Auth
     await auth.deleteUser(userId);
 
-    // Delete from Firestore
-    await db.collection('users').doc(userId).delete();
+    // Delete from MongoDB
+    await User.deleteOne({ uid: userId });
 
     res.json({
       success: true,
@@ -1388,18 +2394,430 @@ app.post('/api/storage/upload-url', verifyToken, async (req, res) => {
   }
 });
 
-// ==================== ANALYTICS ROUTES ====================
+// ==================== STATUS/STORIES ROUTES ====================
 
-// Log analytics event
+// Post a new story
+app.post('/api/statuses', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const { content, mediaUrl, mediaType = 'image', mediaSize, duration, visibility = 'public', allowComments = true } = req.body;
+
+    const user = await User.findOne({ uid: userId }).lean();
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const storyId = `${userId}_${Date.now()}`;
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+    const status = await Status.create({
+      storyId,
+      userId,
+      userName: user.displayName || 'User',
+      userPhoto: user.photoURL || '',
+      content: String(content || '').trim(),
+      mediaUrl,
+      mediaType,
+      mediaSize,
+      duration,
+      visibility,
+      allowComments,
+      expiresAt,
+      views: [],
+      viewsCount: 0,
+    });
+
+    res.json({
+      success: true,
+      data: sanitizeMongoDoc(status),
+    });
+  } catch (error) {
+    console.error('❌ Error posting story:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get stories feed (for discovery)
+app.get('/api/statuses/feed', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const limit = parseLimit(req.query.limit, 50, 200);
+
+    const stories = await Status.find({
+      status: 'active',
+      expiresAt: { $gt: new Date() },
+      $or: [
+        { visibility: 'public' },
+        { userId },
+        { linkedMatches: { $in: await User.findOne({ uid: userId }).select('matches').lean().then(u => u?.matches || []) } }
+      ]
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      stories: stories.map(s => sanitizeMongoDoc(s)),
+    });
+  } catch (error) {
+    console.error('❌ Error fetching stories:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get user's stories
+app.get('/api/statuses/user/:userId', verifyToken, async (req, res) => {
+  try {
+    const limit = parseLimit(req.query.limit, 50, 200);
+    const stories = await Status.find({
+      userId: req.params.userId,
+      status: 'active',
+      expiresAt: { $gt: new Date() },
+    })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      stories: stories.map(s => sanitizeMongoDoc(s)),
+    });
+  } catch (error) {
+    console.error('❌ Error fetching user stories:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// View a story
+app.post('/api/statuses/:storyId/view', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const storyId = req.params.storyId;
+
+    const status = await Status.findOneAndUpdate(
+      { storyId },
+      {
+        $addToSet: { views: userId },
+        $inc: { viewsCount: 1 },
+      },
+      { new: true }
+    );
+
+    if (!status) {
+      return res.status(404).json({ success: false, error: 'Story not found' });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error recording story view:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// React to story
+app.post('/api/statuses/:storyId/react', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const storyId = req.params.storyId;
+    const { emoji } = req.body;
+
+    if (!emoji) {
+      return res.status(400).json({ success: false, error: 'Emoji required' });
+    }
+
+    const status = await Status.findOneAndUpdate(
+      { storyId },
+      {
+        $addToSet: { [`reactions.${emoji}`]: userId },
+      },
+      { new: true }
+    );
+
+    if (!status) {
+      return res.status(404).json({ success: false, error: 'Story not found' });
+    }
+
+    res.json({ success: true, data: sanitizeMongoDoc(status) });
+  } catch (error) {
+    console.error('❌ Error reacting to story:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete story
+app.delete('/api/statuses/:storyId', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const storyId = req.params.storyId;
+
+    const status = await Status.findOne({ storyId }).select('userId').lean();
+    if (!status) {
+      return res.status(404).json({ success: false, error: 'Story not found' });
+    }
+
+    if (status.userId !== userId) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
+    await Status.findOneAndUpdate(
+      { storyId },
+      { $set: { status: 'deleted', deletedAt: new Date() } }
+    );
+
+    res.json({ success: true, message: 'Story deleted' });
+  } catch (error) {
+    console.error('❌ Error deleting story:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ADS ROUTES ====================
+
+// Create ad (advertiser only)
+app.post('/api/ads', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const {
+      title,
+      description,
+      imageUrl,
+      videoUrl,
+      adType = 'banner',
+      callToAction,
+      targetAudience,
+      budget,
+      schedule,
+    } = req.body;
+
+    const user = await User.findOne({ uid: userId }).lean();
+    if (!user) {
+      return res.status(404).json({ success: false, error: 'User not found' });
+    }
+
+    const adId = `ad_${userId}_${Date.now()}`;
+
+    const ad = await Ad.create({
+      adId,
+      advertiserId: userId,
+      advertiserName: user.displayName || 'Advertiser',
+      title,
+      description,
+      imageUrl,
+      videoUrl,
+      adType,
+      callToAction,
+      targetAudience,
+      budget,
+      schedule,
+      status: 'draft',
+    });
+
+    res.json({
+      success: true,
+      data: sanitizeMongoDoc(ad),
+    });
+  } catch (error) {
+    console.error('❌ Error creating ad:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get ads (for display)
+app.get('/api/ads', verifyToken, async (req, res) => {
+  try {
+    const limit = parseLimit(req.query.limit, 20, 100);
+    const adType = req.query.adType || 'banner';
+
+    const now = new Date();
+    const ads = await Ad.find({
+      status: 'active',
+      isActive: true,
+      'schedule.startDate': { $lte: now },
+      'schedule.endDate': { $gte: now },
+      adType,
+    })
+      .sort({ priority: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      ads: ads.map(a => sanitizeMongoDoc(a)),
+    });
+  } catch (error) {
+    console.error('❌ Error fetching ads:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get advertiser's ads
+app.get('/api/ads/advertiser/my-ads', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const limit = parseLimit(req.query.limit, 50, 200);
+
+    const ads = await Ad.find({ advertiserId: userId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json({
+      success: true,
+      ads: ads.map(a => sanitizeMongoDoc(a)),
+    });
+  } catch (error) {
+    console.error('❌ Error fetching ads:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update ad
+app.put('/api/ads/:adId', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const adId = req.params.adId;
+    const updates = req.body;
+
+    const ad = await Ad.findOne({ adId }).select('advertiserId').lean();
+    if (!ad) {
+      return res.status(404).json({ success: false, error: 'Ad not found' });
+    }
+
+    if (ad.advertiserId !== userId) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
+    const updated = await Ad.findOneAndUpdate(
+      { adId },
+      { $set: { ...updates, updatedAt: new Date() } },
+      { new: true }
+    );
+
+    res.json({
+      success: true,
+      data: sanitizeMongoDoc(updated),
+    });
+  } catch (error) {
+    console.error('❌ Error updating ad:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Log ad interaction
+app.post('/api/ads/:adId/interact', verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    const adId = req.params.adId;
+    const { eventType = 'impression', placement = 'discovery_feed' } = req.body;
+
+    const ad = await Ad.findOne({ adId }).lean();
+    if (!ad) {
+      return res.status(404).json({ success: false, error: 'Ad not found' });
+    }
+
+    const analyticsId = `${adId}_${userId}_${Date.now()}`;
+    await Analytics.create({
+      analyticsId,
+      adId,
+      userId,
+      eventType,
+      placement,
+      adFormat: ad.adType,
+      timestamp: new Date(),
+      date: new Date(new Date().setHours(0, 0, 0, 0)),
+    });
+
+    // Update ad metrics
+    const updateOps = {};
+    if (eventType === 'impression') {
+      updateOps['analytics.impressions'] = 1;
+      updateOps['metrics.viewedByUsers'] = userId;
+    } else if (eventType === 'click') {
+      updateOps['analytics.clicks'] = 1;
+      updateOps['metrics.clickedByUsers'] = userId;
+    } else if (eventType === 'conversion') {
+      updateOps['analytics.conversions'] = 1;
+      updateOps['metrics.convertedByUsers'] = userId;
+    }
+
+    if (Object.keys(updateOps).length > 0) {
+      await Ad.updateOne(
+        { adId },
+        { $inc: updateOps, $addToSet: updateOps },
+        { multi: true }
+      );
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ Error logging ad interaction:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ==================== ANALYTICS ROUTES (MongoDB) ====================
+
+// Get analytics for ad
+app.get('/api/analytics/ad/:adId', verifyToken, async (req, res) => {
+  try {
+    const adId = req.params.adId;
+    const days = parseInt(req.query.days) || 7;
+
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - days);
+
+    const analytics = await Analytics.find({
+      adId,
+      date: { $gte: startDate },
+    })
+      .sort({ date: -1, timestamp: -1 })
+      .lean();
+
+    const summary = {
+      impressions: 0,
+      clicks: 0,
+      conversions: 0,
+      ctr: 0,
+      uniqueUsers: new Set(),
+    };
+
+    analytics.forEach(a => {
+      if (a.eventType === 'impression') summary.impressions += a.impressions || 1;
+      if (a.eventType === 'click') summary.clicks += a.clicks || 1;
+      if (a.eventType === 'conversion') summary.conversions += a.conversions || 1;
+      if (a.userId) summary.uniqueUsers.add(a.userId);
+    });
+
+    summary.ctr = summary.impressions > 0 ? (summary.clicks / summary.impressions * 100).toFixed(2) : 0;
+    summary.uniqueUsers = summary.uniqueUsers.size;
+
+    res.json({
+      success: true,
+      summary,
+      analytics: analytics.map(a => sanitizeMongoDoc(a)),
+    });
+  } catch (error) {
+    console.error('❌ Error fetching analytics:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Log analytics event (MongoDB version)
 app.post('/api/analytics/log', verifyToken, async (req, res) => {
   try {
-    const { event, properties } = req.body;
+    const userId = req.user.uid;
+    const { event, properties = {} } = req.body;
 
-    await db.collection('analytics').add({
-      userId: req.user.uid,
-      event,
-      properties: properties || {},
-      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    const analyticsId = `evt_${userId}_${Date.now()}`;
+    await Analytics.create({
+      analyticsId,
+      adId: properties.adId || 'app',
+      userId,
+      eventType: event,
+      ...properties,
+      timestamp: new Date(),
+      date: new Date(new Date().setHours(0, 0, 0, 0)),
     });
 
     res.json({
@@ -1407,8 +2825,8 @@ app.post('/api/analytics/log', verifyToken, async (req, res) => {
       message: 'Event logged successfully'
     });
   } catch (error) {
-    console.error('Error logging analytics:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('❌ Error logging analytics event:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -1463,6 +2881,7 @@ const isUserOnline = (uid) => {
 // Auth middleware – verify Firebase token on every connection
 // Token can come from auth object (preferred) or query string (fallback)
 io.use(async (socket, next) => {
+  console.log(`🔌 [Socket.IO] New handshake attempt from ${socket.id} (URL: ${socket.handshake.url})`);
   try {
     const authHeader = socket.handshake.headers?.authorization || socket.handshake.headers?.Authorization;
     const headerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
@@ -1512,6 +2931,37 @@ io.on('connection', (socket) => {
 
   // Join a personal room so we can target this user directly
   socket.join(userId);
+
+  User.updateOne(
+    { uid: userId },
+    {
+      $setOnInsert: (() => {
+        const defaults = buildDefaultUserData({
+          uid: userId,
+          email: '',
+          displayName: 'User',
+          photoURL: '',
+          isProfileComplete: false,
+        });
+        // Remove fields that will be set by $set operator
+        delete defaults.online;
+        delete defaults.lastSeen;
+        delete defaults.lastActive;
+        return defaults;
+      })(),
+      $set: {
+        online: true,
+        lastSeen: null,
+        lastActive: new Date(),
+      },
+    },
+    {
+      upsert: true,
+      setDefaultsOnInsert: true,
+    }
+  ).catch((error) => {
+    console.error(`❌ Failed to persist online presence for ${userId}:`, error.message);
+  });
 
   // Broadcast online status
   socket.broadcast.emit('presence_update', { userId, status: 'online', lastSeen: null });
@@ -1696,6 +3146,18 @@ io.on('connection', (socket) => {
       sockets.delete(socket.id);
       if (sockets.size === 0) {
         onlineUsers.delete(userId);
+        User.updateOne(
+          { uid: userId },
+          {
+            $set: {
+              online: false,
+              lastSeen: new Date(),
+              lastActive: new Date(),
+            },
+          }
+        ).catch((error) => {
+          console.error(`❌ Failed to persist offline presence for ${userId}:`, error.message);
+        });
         socket.broadcast.emit('presence_update', {
           userId,
           status: 'offline',
@@ -1801,24 +3263,57 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
   // Prevent duplicate queue entries for the same socket.
   removeSocketFromVideoQueues(socket.id);
 
-  let gender = clientProvidedGender;
+  let gender = null;
+  let userDoc = null;
 
-  // Since Firebase Admin SDK is throwing 16 UNAUTHENTICATED issues, we must strictly rely on the client providing gender.
-  if (!gender) {
+  // Fetch the user profile from MongoDB to check status and gender
+  try {
+    userDoc = await User.findOne({ uid: userId }).select('gender isProfileComplete verified').lean();
+  } catch (mongoError) {
+    console.warn(`⚠️ [VideoMatch] Failed to fetch user profile for ${userId}: ${mongoError.message}`);
+  }
+
+  // Verify profile is complete or verified to participate in video matching
+  if (!userDoc) {
     socket.emit('video_match_error', { 
-      error: 'Client failed to send gender data. Please ensure you are using the latest version of the app.' 
+      error: 'User profile not found in database' 
     });
-    console.error(`❌ [VideoMatch] Client did not provide gender and Firestore fallback is disabled. User: ${userId}`);
+    console.error(`❌ [VideoMatch] User ${userId} not found in database`);
     return;
   }
 
-  gender = gender?.toLowerCase().trim();
-
-  if (!gender || (gender !== 'male' && gender !== 'female')) {
-    socket.emit('video_match_error', {
-      error: 'Gender not set in profile. Please update your profile.'
+  if (!userDoc.isProfileComplete && !userDoc.verified) {
+    socket.emit('video_match_error', { 
+      error: 'Profile incomplete or not verified. Please complete your profile to use video matching.' 
     });
-    console.error(`❌ [VideoMatch] Invalid gender for user ${userId}: ${gender}`);
+    console.log(`ℹ️ [VideoMatch] Blocked incomplete/unverified user ${userId}`);
+    return;
+  }
+
+  // Normalize gender: try client-provided first, then fall back to MongoDB
+  if (clientProvidedGender) {
+    gender = User.normalizeGender(clientProvidedGender);
+  }
+  
+  if (!gender && userDoc?.gender) {
+    gender = User.normalizeGender(userDoc.gender);
+    console.log(`ℹ️ [VideoMatch] Fetched gender from MongoDB for user ${userId}: ${gender}`);
+  }
+  
+  if (!gender) {
+    socket.emit('video_match_error', { 
+      error: 'Gender must be set to Male or Female to use video matching' 
+    });
+    console.error(`❌ [VideoMatch] No valid gender for user ${userId}`);
+    return;
+  }
+
+  // Only allow 'male' and 'female' for opposite-gender matching
+  if (!['male', 'female'].includes(gender)) {
+    socket.emit('video_match_error', {
+      error: 'Gender must be set to Male or Female to use video matching'
+    });
+    console.error(`❌ [VideoMatch] Invalid gender for ${userId}: ${gender}`);
     return;
   }
 
@@ -1827,15 +3322,8 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
   const userInfo = { userId, gender, socketId: socket.id };
 
   // Determine which queues to use for matching
-  let myQueue;
-  let oppositeQueue;
-  if (gender === 'male') {
-    myQueue = maleQueue;
-    oppositeQueue = femaleQueue;
-  } else {
-    myQueue = femaleQueue;
-    oppositeQueue = maleQueue;
-  }
+  const myQueue = gender === 'male' ? maleQueue : femaleQueue;
+  const oppositeQueue = gender === 'male' ? femaleQueue : maleQueue;
 
   const partner = findNextValidPartner(oppositeQueue, socket.id);
 
@@ -1843,6 +3331,12 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
     // Create pair
     videoCallPairs.set(socket.id, partner.partnerSocketId);
     videoCallPairs.set(partner.partnerSocketId, socket.id);
+
+    // Remove both from queues
+    maleQueue.delete(socket.id);
+    femaleQueue.delete(socket.id);
+    maleQueue.delete(partner.partnerSocketId);
+    femaleQueue.delete(partner.partnerSocketId);
 
     // Send ICE servers and match info to both parties
     socket.emit('video_match_found', {
@@ -1859,7 +3353,7 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
       isInitiator: false // This user receives the call
     });
 
-    console.log(`✅ [VideoMatch] Matched ${userId} with ${partner.partnerInfo.userId}`);
+    console.log(`✅ [VideoMatch] Matched ${userId} (${gender}) with ${partner.partnerInfo.userId} (${partner.partnerInfo.gender})`);
   } else {
     // No match available, add to queue
     myQueue.set(socket.id, userInfo);
@@ -1867,7 +3361,7 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
       message: 'Searching for a match...',
       queuePosition: myQueue.size
     });
-    console.log(`⏳ [VideoMatch] ${userId} added to ${gender} queue (${myQueue.size} waiting)`);
+    console.log(`⏳ [VideoMatch] ${userId} (${gender}) added to queue (${myQueue.size} waiting)`);
   }
 };
 
