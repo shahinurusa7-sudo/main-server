@@ -2989,13 +2989,16 @@ io.on('connection', (socket) => {
   // ── send_message ────────────────────────────────────────────
   socket.on('send_message', async (data) => {
     try {
-      const { messageId, chatId, receiverId, content, mediaUrl, messageType, timestamp } = data;
+      const { messageId, chatId, receiverId, content, mediaUrl, messageType, timestamp, replyToId } = data;
 
       // 1. Always queue message in MongoDB FIRST (Status: pending)
       try {
         const exists = await PendingMessage.findOne({ messageId });
         if (!exists) {
           const encryptedPayload = encryptMessageContent(content);
+          const metadata = { enc: encryptedPayload.enc };
+          if (replyToId) metadata.replyToId = replyToId;
+
           await new PendingMessage({
             messageId,
             senderId: userId,
@@ -3005,7 +3008,7 @@ io.on('connection', (socket) => {
             content: encryptedPayload.content,
             mediaUrl,
             status: 'pending',
-            metadata: { enc: encryptedPayload.enc },
+            metadata,
           }).save();
         }
       } catch (dbErr) {
@@ -3026,6 +3029,7 @@ io.on('connection', (socket) => {
           mediaUrl,
           messageType: messageType || 'text',
           timestamp: timestamp || Date.now(),
+          replyToId,
         });
         console.log(`📤 [Socket.IO] Message ${messageId} emitted to online user ${receiverId}`);
       } else {
@@ -3064,6 +3068,7 @@ io.on('connection', (socket) => {
           mediaUrl: m.mediaUrl,
           messageType: m.messageType,
           timestamp: m.createdAt.getTime(),
+          replyToId: m?.metadata?.replyToId,
         })));
         console.log(`📬 [Socket.IO] Sent ${pending.length} pending messages to ${userId}`);
       }
