@@ -37,9 +37,22 @@ app.use(helmet({
   crossOriginOpenerPolicy: false,
 }));
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+  origin: (origin, callback) => {
+    // Allow all origins if ALLOWED_ORIGINS is '*'
+    if (!origin || process.env.ALLOWED_ORIGINS === '*') {
+      callback(null, true);
+    } else {
+      const allowed = process.env.ALLOWED_ORIGINS.split(',');
+      if (allowed.indexOf(origin) !== -1) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    }
+  },
   credentials: true
 }));
+
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(morgan('combined')); // Logging
