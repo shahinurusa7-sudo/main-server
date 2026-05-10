@@ -22,7 +22,8 @@ const Status = require('./models/Status');
 const Ad = require('./models/Ad');
 const Analytics = require('./models/Analytics');
 const packageJson = require('./package.json');
-const push = require('./push_notification');
+const push = require('./push-notification');
+
 
 
 // Initialize Express App
