@@ -3052,32 +3052,8 @@ app.post('/api/analytics/log', verifyToken, async (req, res) => {
 // ==================== ERROR HANDLING ====================
 
 
-// ── Admin Panel Integration ────────────────────────────────────
-try {
-  require('./admin_logic')(io, app);
-} catch (e) {
-  console.error('⚠️ Failed to load Admin Logic module:', e.message);
-}
-
-// 404 handler
-
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not Found',
-    message: 'The requested endpoint does not exist'
-  });
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal Server Error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
-  });
-});
-
 // ==================== START SERVER ====================
+
 
 // Wrap Express in an HTTP server so Socket.IO can share the same port
 const httpServer = http.createServer(app);
@@ -3731,7 +3707,34 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
 };
 
 
+
+// ── Admin Panel Integration ────────────────────────────────────
+try {
+  require('./admin_logic')(io, app);
+} catch (e) {
+  console.error('⚠️ Failed to load Admin Logic module:', e.message);
+}
+
+// ── Error Handling (MUST BE LAST) ──────────────────────────────
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    error: 'Not Found',
+    message: 'The requested endpoint does not exist'
+  });
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+  });
+});
+
 // Bind on 0.0.0.0 so physical devices on the same WiFi can connect
+
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   const os = require('os');
