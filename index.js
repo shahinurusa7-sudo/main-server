@@ -706,6 +706,30 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
     console.log('✅ MongoDB connected successfully');
     console.log(`📦 Temporary SMS/message storage active in MongoDB: ${maskMongoUri(mongoUri)}`);
 
+    // ── Database Maintenance: Auto-Drop Stale Indexes ──
+    try {
+      const db = mongoose.connection.db;
+      
+      // Fix Likes Index
+      const likesColl = db.collection('likes');
+      const likesIndexes = await likesColl.indexes();
+      if (likesIndexes.find(i => i.name === 'fromId_1_toId_1')) {
+        console.log('🧹 Dropping stale index: likes.fromId_1_toId_1');
+        await likesColl.dropIndex('fromId_1_toId_1');
+      }
+
+      // Fix Users Index (Case Sensitivity issue)
+      const usersColl = db.collection('users');
+      const userIndexes = await usersColl.indexes();
+      if (userIndexes.find(i => i.name === 'email_1' && !i.unique)) {
+        console.log('🧹 Dropping non-unique email index on users');
+        await usersColl.dropIndex('email_1');
+      }
+    } catch (maintenanceErr) {
+      console.warn('⚠️  Database maintenance skipped:', maintenanceErr.message);
+    }
+
+
     // Setup automatic cleanup of old delivered messages (runs daily)
     setInterval(async () => {
       try {
@@ -3020,7 +3044,16 @@ app.post('/api/analytics/log', verifyToken, async (req, res) => {
 
 // ==================== ERROR HANDLING ====================
 
+
+// ── Admin Panel Integration ────────────────────────────────────
+try {
+  require('./admin_logic')(io, app);
+} catch (e) {
+  console.error('⚠️ Failed to load Admin Logic module:', e.message);
+}
+
 // 404 handler
+
 app.use((req, res) => {
   res.status(404).json({
     error: 'Not Found',
@@ -3690,14 +3723,9 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
   }
 };
 
-// ── Admin Panel Integration ────────────────────────────────────
-try {
-  require('./admin_logic')(io, app);
-} catch (e) {
-  console.error('⚠️ Failed to load Admin Logic module:', e.message);
-}
 
 // Bind on 0.0.0.0 so physical devices on the same WiFi can connect
+
 httpServer.listen(PORT, '0.0.0.0', () => {
   const os = require('os');
   const nets = os.networkInterfaces();
