@@ -713,18 +713,25 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
       // Fix Likes Index
       const likesColl = db.collection('likes');
       const likesIndexes = await likesColl.indexes();
-      if (likesIndexes.find(i => i.name === 'fromId_1_toId_1')) {
-        console.log('🧹 Dropping stale index: likes.fromId_1_toId_1');
-        await likesColl.dropIndex('fromId_1_toId_1');
+      
+      // Drop ALL problematic legacy indexes if they exist
+      const toDrop = ['fromId_1_toId_1', 'fromUserId_1_toUserId_1_unique', 'fromId_1_toId_1_1'];
+      for (const idxName of toDrop) {
+        if (likesIndexes.find(i => i.name === idxName)) {
+          console.log(`🧹 Dropping legacy index: likes.${idxName}`);
+          await likesColl.dropIndex(idxName).catch(e => console.warn(`   (Note: Could not drop ${idxName}: ${e.message})`));
+        }
       }
 
-      // Fix Users Index (Case Sensitivity issue)
+      // Fix Users Index (Non-unique email cleanup)
       const usersColl = db.collection('users');
       const userIndexes = await usersColl.indexes();
       if (userIndexes.find(i => i.name === 'email_1' && !i.unique)) {
         console.log('🧹 Dropping non-unique email index on users');
-        await usersColl.dropIndex('email_1');
+        await usersColl.dropIndex('email_1').catch(() => {});
       }
+      
+      console.log('✅ Database maintenance completed');
     } catch (maintenanceErr) {
       console.warn('⚠️  Database maintenance skipped:', maintenanceErr.message);
     }
