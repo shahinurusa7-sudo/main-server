@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
+    "admin": "node admin-server.js",
+    "admin-dev": "nodemon admin-server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [

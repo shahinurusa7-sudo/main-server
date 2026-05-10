@@ -22,6 +22,7 @@ const Status = require('./models/Status');
 const Ad = require('./models/Ad');
 const Analytics = require('./models/Analytics');
 const packageJson = require('./package.json');
+const push = require('./push notification');
 
 // Initialize Express App
 const app = express();
@@ -99,6 +100,8 @@ try {
   });
 
   console.log('✅ Firebase Admin SDK initialized successfully');
+  // Initialize push notification module (MongoDB-only, no Firestore)
+  push.init(admin, require('./models/User'));
 } catch (error) {
   console.error('❌ Error initializing Firebase Admin SDK:', error.message);
   process.exit(1);
@@ -135,14 +138,14 @@ const smtpConfigured =
 
 const smtpTransporter = smtpConfigured
   ? nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: SMTP_PORT,
-      secure: SMTP_SECURE,
-      auth: {
-        user: SMTP_USER,
-        pass: SMTP_PASS,
-      },
-    })
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_SECURE,
+    auth: {
+      user: SMTP_USER,
+      pass: SMTP_PASS,
+    },
+  })
   : null;
 
 if (WELCOME_EMAIL_ENABLED) {
@@ -492,6 +495,111 @@ const serializePendingMessageForClient = (msg) => ({
   metadata: msg.metadata || {}
 });
 
+/**
+ * Collect all valid FCM tokens for a user from both 'fcmToken' (single)
+ * and 'fcmTokens' (map of token -> true/false) fields.
+ */
+const collectFcmTokensForUser = async (userId) => {
+  const userData = await User.findOne({ uid: userId }).select('fcmToken fcmTokens').lean();
+  if (!userData) return [];
+
+  const tokens = new Set();
+
+  // Single token field
+  if (typeof userData.fcmToken === 'string' && userData.fcmToken.trim().length > 0) {
+    tokens.add(userData.fcmToken.trim());
+  }
+
+  // Map of { token: true/false }
+  if (userData.fcmTokens && typeof userData.fcmTokens === 'object') {
+    for (const [token, enabled] of Object.entries(userData.fcmTokens)) {
+      if (typeof token === 'string' && token.trim().length > 0 && enabled === true) {
+        tokens.add(token.trim());
+      }
+    }
+  }
+
+  return Array.from(tokens);
+};
+
+/**
+ * Send a push notification to a user by their userId.
+ * Looks up all their FCM tokens and sends to each (up to 3).
+ * Returns true if at least one notification was sent.
+ */
+const sendPushToUser = async (userId, { title, body, data = {} }) => {
+  if (!userId) return false;
+  try {
+    const tokens = await collectFcmTokensForUser(userId);
+    if (tokens.length === 0) {
+      console.warn(`⚠️ [FCM] No FCM tokens found for user ${userId}`);
+      return false;
+    }
+
+    // Ensure all data values are strings (FCM requirement)
+    const stringData = {};
+    for (const [k, v] of Object.entries(data)) {
+      stringData[k] = String(v ?? '');
+    }
+
+    let sent = 0;
+    for (const token of tokens.slice(0, 3)) {
+      try {
+        // Determine channel based on notification type
+        const type = stringData.type || '';
+        const channelId = (type === 'like' || type === 'match') ? 'matches' : 'messages';
+
+        await admin.messaging().send({
+          notification: { title, body },
+          data: stringData,
+          token,
+          // Android: high priority so the notification is delivered instantly
+          // even when the device is in Doze mode or the app is closed
+          android: {
+            priority: 'high',
+            notification: {
+              channelId,
+              priority: 'high',
+              defaultSound: true,
+              defaultVibrateTimings: true,
+              notificationCount: 1,
+            },
+          },
+          // iOS: max priority so APNs delivers it immediately
+          apns: {
+            headers: {
+              'apns-priority': '10',
+              'apns-push-type': 'alert',
+            },
+            payload: {
+              aps: {
+                sound: 'default',
+                badge: 1,
+                contentAvailable: true,
+              },
+            },
+          },
+        });
+        sent++;
+      } catch (tokenErr) {
+        // Remove stale token from MongoDB if FCM explicitly rejects it
+        if (tokenErr.code === 'messaging/registration-token-not-registered' ||
+          tokenErr.code === 'messaging/invalid-registration-token') {
+          console.warn(`🗑️ [FCM] Removing stale token for user ${userId}`);
+          User.updateOne({ uid: userId }, { $unset: { fcmToken: '' } }).catch(() => { });
+        }
+        console.warn(`⚠️ [FCM] Failed to send to token for ${userId}: ${tokenErr.message}`);
+      }
+    }
+
+    console.log(`✅ [FCM] Sent ${sent}/${tokens.length} notifications to user ${userId}`);
+    return sent > 0;
+  } catch (error) {
+    console.warn(`⚠️ [FCM] sendPushToUser error for ${userId}: ${error.message}`);
+    return false;
+  }
+};
+
 const sendNewMessagePushNotification = async ({
   receiverId,
   senderId,
@@ -502,36 +610,28 @@ const sendNewMessagePushNotification = async ({
 }) => {
   if (!receiverId) return false;
 
+  // Attempt to get sender name for a better notification
+  let senderName = 'New Message';
   try {
-    const receiverData = await User.findOne({ uid: receiverId }).select('fcmToken').lean();
-    if (!receiverData) {
-      return false;
+    const sender = await User.findOne({ uid: senderId }).select('displayName').lean();
+    if (sender && sender.displayName) {
+      senderName = sender.displayName;
     }
-
-    const fcmToken = receiverData.fcmToken;
-    if (!fcmToken) {
-      return false;
-    }
-
-    await admin.messaging().send({
-      notification: {
-        title: 'New Message',
-        body: messageType === 'text' ? String(content || '') : `Sent a ${messageType || 'message'}`,
-      },
-      data: {
-        type: 'new_message',
-        chatId: String(chatId || ''),
-        messageId: String(messageId || ''),
-        senderId: String(senderId || ''),
-      },
-      token: fcmToken,
-    });
-
-    return true;
-  } catch (error) {
-    console.warn('Failed to send push notification:', error.message);
-    return false;
+  } catch (e) {
+    console.warn(`⚠️ [FCM] Could not fetch sender name for ${senderId}: ${e.message}`);
   }
+
+  return sendPushToUser(receiverId, {
+    title: senderName,
+    body: messageType === 'text' ? String(content || '').slice(0, 100) : `Sent a ${messageType || 'message'}`,
+    data: {
+      type: 'new_message',
+      chatId: String(chatId || ''),
+      messageId: String(messageId || ''),
+      senderId: String(senderId || ''),
+      senderName: senderName,
+    },
+  });
 };
 
 const normalizeMongoUri = (uri) => {
@@ -575,7 +675,7 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
     const mongoUri = normalizeMongoUri(configuredMongoUri);
 
     console.log(`🔄 MongoDB connection attempt ${attempt}/${maxAttempts}...`);
-    
+
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 30000, // Increased from 15s to 30s
       socketTimeoutMS: 45000,
@@ -584,7 +684,7 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
       maxPoolSize: 10,
       minPoolSize: 2,
     });
-    
+
     console.log('✅ MongoDB connected successfully');
     console.log(`📦 Temporary SMS/message storage active in MongoDB: ${maskMongoUri(mongoUri)}`);
 
@@ -600,11 +700,11 @@ const connectMongoDB = async (attempt = 1, maxAttempts = 3) => {
 
   } catch (error) {
     console.error(`❌ MongoDB connection attempt ${attempt} failed:`, error.message);
-    
+
     // Log more diagnostic info
     if (error.reason) console.error('   Reason:', error.reason);
     if (error.code) console.error('   Code:', error.code);
-    
+
     if (attempt < maxAttempts) {
       const delayMs = Math.min(5000 * attempt, 15000); // Exponential backoff: 5s, 10s, 15s
       console.log(`⏳ Retrying in ${delayMs / 1000} seconds...`);
@@ -914,13 +1014,13 @@ const verifyToken = async (req, res, next) => {
     console.log('🔐 Verifying Firebase ID token...');
     const decodedToken = await auth.verifyIdToken(token);
     console.log(`✅ Token verified for user: ${decodedToken.uid} (${decodedToken.email})`);
-    
+
     req.user = decodedToken;
     next();
   } catch (error) {
     console.error('❌ Token verification failed:', error.message);
     console.error('   Error code:', error.code);
-    return res.status(403).json({ 
+    return res.status(403).json({
       error: 'Invalid or expired token',
       message: `Token verification failed: ${error.message}`,
       code: error.code
@@ -958,7 +1058,7 @@ app.get('/health', (req, res) => {
 app.get('/api/firestore-test', async (req, res) => {
   try {
     console.log('\n🧪 ===== FIRESTORE DIAGNOSTICS TEST =====');
-    
+
     // Test 1: Check if db is initialized
     console.log('✓ Step 1: Check Firestore initialization');
     if (!db) {
@@ -1122,9 +1222,9 @@ app.post('/api/auth/complete-profile', verifyToken, async (req, res) => {
       ).trim(),
       // Prioritize: if user uploads new pic use it, otherwise keep database pic, only fallback to Google if absolutely no pic exists
       photoURL: String(
-        req.body?.photoURL || 
-        existingUser?.photoURL || 
-        (req.user.picture && !existingUser?.photoURL ? req.user.picture : '') || 
+        req.body?.photoURL ||
+        existingUser?.photoURL ||
+        (req.user.picture && !existingUser?.photoURL ? req.user.picture : '') ||
         ''
       ).trim(),
     };
@@ -1193,9 +1293,9 @@ app.get('/api/users', verifyToken, async (req, res) => {
       : null;
     const ids = hasText(req.query.ids)
       ? String(req.query.ids)
-          .split(',')
-          .map((item) => item.trim())
-          .filter(Boolean)
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean)
       : [];
 
     const query = {};
@@ -1204,7 +1304,7 @@ app.get('/api/users', verifyToken, async (req, res) => {
       query.uid = { $in: ids };
     }
     if (gender) {
-      query.gender = gender;
+      query.gender = { $regex: new RegExp(`^${gender}$`, 'i') };
     }
     if (minAge !== null || maxAge !== null) {
       query.age = {};
@@ -1232,8 +1332,8 @@ app.get('/api/users', verifyToken, async (req, res) => {
       success: true,
       users: ids.length > 0
         ? ids
-            .map((uid) => serialized.find((user) => user.uid === uid))
-            .filter(Boolean)
+          .map((uid) => serialized.find((user) => user.uid === uid))
+          .filter(Boolean)
         : serialized,
     });
   } catch (error) {
@@ -1550,6 +1650,13 @@ app.post('/api/likes', verifyToken, async (req, res) => {
       });
     }
 
+    const fromUserName = String(
+      req.body?.fromUserName || fromUser.displayName || req.user.name || 'User'
+    ).trim();
+    const fromUserPhoto = String(
+      req.body?.fromUserPhoto || fromUser.photoURL || req.user.picture || ''
+    ).trim();
+
     const likeId = `${fromUserId}_${toUserId}`;
     const likeDoc = await Like.findOneAndUpdate(
       { likeId },
@@ -1558,12 +1665,8 @@ app.post('/api/likes', verifyToken, async (req, res) => {
           likeId,
           fromUserId,
           toUserId,
-          fromUserName: String(
-            req.body?.fromUserName || fromUser.displayName || req.user.name || 'User'
-          ).trim(),
-          fromUserPhoto: String(
-            req.body?.fromUserPhoto || fromUser.photoURL || req.user.picture || ''
-          ).trim(),
+          fromUserName,
+          fromUserPhoto,
           timestamp: new Date(),
           isRead: false,
         },
@@ -1574,6 +1677,9 @@ app.post('/api/likes', verifyToken, async (req, res) => {
         setDefaultsOnInsert: true,
       }
     );
+
+    // Track whether this like was newly created (not a duplicate)
+    const isNewLike = likeDoc.timestamp && (Date.now() - new Date(likeDoc.timestamp).getTime()) < 5000;
 
     await Promise.all([
       User.updateOne(
@@ -1593,6 +1699,27 @@ app.post('/api/likes', verifyToken, async (req, res) => {
     let matchId = null;
     if (reciprocalLike) {
       matchId = await ensureActiveMatch(fromUserId, toUserId);
+
+      // Send mutual match notification to BOTH users (fire-and-forget)
+      setImmediate(() => {
+        push.newMatch({
+          userId1: fromUserId,
+          userId2: toUserId,
+          userName1: fromUserName,
+          userName2: toUser.displayName || 'someone',
+          matchId: String(matchId || ''),
+        }).catch(() => {});
+      });
+    } else if (isNewLike) {
+      // Send like notification to the receiver (fire-and-forget)
+      setImmediate(() => {
+        push.newLike({
+          toUserId,
+          fromUserId,
+          fromUserName,
+          fromUserPhoto,
+        }).catch(() => {});
+      });
     }
 
     return res.json({
@@ -2030,24 +2157,55 @@ app.post('/api/notifications/send', verifyToken, async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // FCM requires all data values to be strings
+    const stringData = {};
+    if (data && typeof data === 'object') {
+      for (const [k, v] of Object.entries(data)) {
+        stringData[k] = String(v ?? '');
+      }
+    }
+
+    const type = stringData.type || '';
+    const channelId = (type === 'like' || type === 'match') ? 'matches' : 'messages';
+
     const message = {
-      notification: {
-        title,
-        body
+      notification: { title, body },
+      data: stringData,
+      token,
+      // Deliver instantly even when phone is in Doze/background (like WhatsApp)
+      android: {
+        priority: 'high',
+        notification: {
+          channelId,
+          priority: 'high',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+        },
       },
-      data: data || {},
-      token
+      apns: {
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': 'alert',
+        },
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+            contentAvailable: true,
+          },
+        },
+      },
     };
 
     const response = await admin.messaging().send(message);
 
     res.json({
       success: true,
-      messageId: response
+      messageId: response,
     });
   } catch (error) {
     console.error('Error sending notification:', error);
-    res.status(500).json({ error: 'Failed to send notification' });
+    res.status(500).json({ error: 'Failed to send notification', message: error.message });
   }
 });
 
@@ -2139,7 +2297,7 @@ app.post('/api/messages/send', verifyToken, async (req, res) => {
       await pendingMessage.save();
 
       // Receiver may have internet but app closed/background: notify via FCM.
-      await sendNewMessagePushNotification({
+      await push.newMessage({
         receiverId,
         senderId: req.user.uid,
         chatId,
@@ -2902,7 +3060,7 @@ io.use(async (socket, next) => {
 
     const token = socket.handshake.auth?.token || socket.handshake.query?.token || headerToken;
     console.log(`🔐 [Socket.IO] Auth attempt - Token present: ${!!token}, From: ${token ? (token.length > 20 ? 'auth object' : 'query string') : 'none'}`);
-    
+
     if (!token) {
       console.error('❌ [Socket.IO] No token provided in auth/query/header');
       return next(new Error('No token provided'));
@@ -2918,7 +3076,7 @@ io.use(async (socket, next) => {
 
     // Verify token with timeout (max 5 seconds to prevent hanging)
     const verifyPromise = admin.auth().verifyIdToken(token);
-    const timeoutPromise = new Promise((_, reject) => 
+    const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('Token verification timeout')), 5000)
     );
 
@@ -3034,7 +3192,7 @@ io.on('connection', (socket) => {
         console.log(`📤 [Socket.IO] Message ${messageId} emitted to online user ${receiverId}`);
       } else {
         // 4. Trigger push notification ONLY if offline
-        await sendNewMessagePushNotification({
+        await push.newMessage({
           receiverId,
           senderId: userId,
           chatId,
@@ -3168,7 +3326,7 @@ io.on('connection', (socket) => {
       let clientGender = null;
       let parsedData = data;
       if (typeof parsedData === 'string') {
-        try { parsedData = JSON.parse(parsedData); } catch(e) {}
+        try { parsedData = JSON.parse(parsedData); } catch (e) { }
       }
       if (Array.isArray(parsedData) && parsedData.length > 0) {
         parsedData = parsedData[0];
@@ -3183,7 +3341,7 @@ io.on('connection', (socket) => {
       socket.emit('video_match_error', { error: 'Failed to start matching' });
     }
   });
-  
+
   // ── video_match_cancel: Leave the matching queue ──
   socket.on('video_match_cancel', () => {
     const userId = socket.userId;
@@ -3195,62 +3353,62 @@ io.on('connection', (socket) => {
     socket.emit('video_match_cancelled', { message: 'Matching cancelled' });
     console.log(`❌ [VideoMatch] ${userId} cancelled matching`);
   });
-  
+
   // ── WebRTC signaling: offer ──
   socket.on('webrtc_offer', (data) => {
     const { offer, targetSocketId } = data;
-    
+
     if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
       console.error('[WebRTC] Invalid offer - not paired');
       return;
     }
-    
+
     io.to(targetSocketId).emit('webrtc_offer', {
       offer,
       fromSocketId: socket.id
     });
-    
+
     console.log(`📞 [WebRTC] Offer sent from ${socket.id} to ${targetSocketId}`);
   });
-  
+
   // ── WebRTC signaling: answer ──
   socket.on('webrtc_answer', (data) => {
     const { answer, targetSocketId } = data;
-    
+
     if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
       console.error('[WebRTC] Invalid answer - not paired');
       return;
     }
-    
+
     io.to(targetSocketId).emit('webrtc_answer', {
       answer,
       fromSocketId: socket.id
     });
-    
+
     console.log(`📞 [WebRTC] Answer sent from ${socket.id} to ${targetSocketId}`);
   });
-  
+
   // ── WebRTC signaling: ICE candidate ──
   socket.on('webrtc_ice_candidate', (data) => {
     const { candidate, targetSocketId } = data;
-    
+
     if (!videoCallPairs.has(socket.id) || videoCallPairs.get(socket.id) !== targetSocketId) {
       console.error('[WebRTC] Invalid ICE candidate - not paired');
       return;
     }
-    
+
     io.to(targetSocketId).emit('webrtc_ice_candidate', {
       candidate,
       fromSocketId: socket.id
     });
-    
+
     console.log(`🧊 [WebRTC] ICE candidate sent from ${socket.id} to ${targetSocketId}`);
   });
-  
+
   // ── video_call_next: Skip to next random match ──
   socket.on('video_call_next', async (data) => {
     const userId = socket.userId;
-    
+
     // End current call if exists
     if (terminateVideoPair(socket, {
       partnerReason: 'partner_skipped',
@@ -3258,16 +3416,16 @@ io.on('connection', (socket) => {
     })) {
       console.log(`⏭️ [VideoMatch] ${userId} skipped to next`);
     }
-    
+
     // End call notification
     socket.emit('video_call_ended', { reason: 'looking_for_next' });
-    
+
     // Automatically search for next match (gender passed from client if available)
     setTimeout(() => {
       let clientGender = null;
       let parsedData = data;
       if (typeof parsedData === 'string') {
-        try { parsedData = JSON.parse(parsedData); } catch(e) {}
+        try { parsedData = JSON.parse(parsedData); } catch (e) { }
       }
       if (Array.isArray(parsedData) && parsedData.length > 0) {
         parsedData = parsedData[0];
@@ -3282,7 +3440,7 @@ io.on('connection', (socket) => {
       });
     }, 500);
   });
-  
+
   // ── video_call_end: End current call ──
   socket.on('video_call_end', () => {
     if (terminateVideoPair(socket, {
@@ -3319,17 +3477,17 @@ io.on('connection', (socket) => {
         });
       }
     }
-    
+
     // Handle video call disconnection
     terminateVideoPair(socket, {
       partnerReason: 'partner_disconnected',
       emitSelf: false,
     });
-    
+
     // Remove from waiting queues
     maleQueue.delete(socket.id);
     femaleQueue.delete(socket.id);
-    
+
     console.log(`📴 [Socket.IO] User disconnected: ${userId} (${socket.id})`);
   });
 });
@@ -3429,8 +3587,8 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
 
   // Verify profile exists (may be incomplete)
   if (!userDoc) {
-    socket.emit('video_match_error', { 
-      error: 'User profile not found in database' 
+    socket.emit('video_match_error', {
+      error: 'User profile not found in database'
     });
     console.error(`❌ [VideoMatch] User ${userId} not found in database`);
     return;
@@ -3443,15 +3601,15 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
   if (clientProvidedGender) {
     gender = User.normalizeGender(clientProvidedGender);
   }
-  
+
   if (!gender && userDoc?.gender) {
     gender = User.normalizeGender(userDoc.gender);
     console.log(`ℹ️ [VideoMatch] Fetched gender from MongoDB for user ${userId}: ${gender}`);
   }
-  
+
   if (!gender) {
-    socket.emit('video_match_error', { 
-      error: 'Gender must be set to Male or Female to use video matching' 
+    socket.emit('video_match_error', {
+      error: 'Gender must be set to Male or Female to use video matching'
     });
     console.error(`❌ [VideoMatch] No valid gender for user ${userId}`);
     return;
@@ -3514,6 +3672,13 @@ const startVideoMatchForSocket = async (socket, clientProvidedGender) => {
   }
 };
 
+// ── Admin Panel Integration ────────────────────────────────────
+try {
+  require('./admin_logic')(io, app);
+} catch (e) {
+  console.error('⚠️ Failed to load Admin Logic module:', e.message);
+}
+
 // Bind on 0.0.0.0 so physical devices on the same WiFi can connect
 httpServer.listen(PORT, '0.0.0.0', () => {
   const os = require('os');
@@ -3522,13 +3687,13 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   for (const name of Object.keys(nets)) {
     // Ignore virtual and VPN adapters to prevent logging multiple tricky IPs
     const lowerName = name.toLowerCase();
-    if (lowerName.includes('virtual') || lowerName.includes('vmware') || 
-        lowerName.includes('wsl') || lowerName.includes('vbox') || 
-        lowerName.includes('vethernet') || lowerName.includes('vpn') ||
-        lowerName.includes('mcafee')) {
+    if (lowerName.includes('virtual') || lowerName.includes('vmware') ||
+      lowerName.includes('wsl') || lowerName.includes('vbox') ||
+      lowerName.includes('vethernet') || lowerName.includes('vpn') ||
+      lowerName.includes('mcafee')) {
       continue;
     }
-    
+
     for (const net of nets[name]) {
       if (net.family === 'IPv4' && !net.internal) {
         localIPs.push(`  📱 Physical device URL: http://${net.address}:${PORT} (via ${name})`);
