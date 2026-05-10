@@ -8,9 +8,11 @@ const User = require('./models/User');
 const Match = require('./models/Match');
 const SponsorAd = require('./models/SponsorAd');
 const SystemSettings = require('./models/SystemSettings');
+const Report = require('./models/Report');
+
 
 const JWT_SECRET = process.env.JWT_SECRET || 'julieet-admin-secret-key-9988-shahinur';
-const SUPER_ADMIN_EMAIL = 'shahinuralam@julieet.com';
+const SUPER_ADMIN_EMAIL = 'indxadmincherry@julieet.com';
 
 // ─── Email Transporter ───────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -51,6 +53,33 @@ const upload = multer({
 // ─── Main export ─────────────────────────────────────────────────────────────
 module.exports = function (io, app) {
   console.log('🛡️  Admin Module: Initializing /admin namespace & routes...');
+
+  // ── Auto-Provision Super Admin ──────────────────────────────────────────
+  (async () => {
+    try {
+      const mainEmail = 'indxadmincherry@julieet.com';
+      const mainPass = 'SC18232005@:)(:&^%';
+      let mainAdmin = await Admin.findOne({ email: mainEmail });
+      
+      if (!mainAdmin) {
+        mainAdmin = new Admin({ 
+          email: mainEmail, 
+          role: 'super_admin',
+          displayName: 'Super Admin',
+          isActive: true
+        });
+        mainAdmin.password = mainPass;
+        await mainAdmin.save();
+        console.log('✅ Main Super Admin created with password login.');
+      } else if (!mainAdmin.password) {
+        mainAdmin.password = mainPass;
+        await mainAdmin.save();
+        console.log('✅ Main Super Admin updated with password login.');
+      }
+    } catch (err) {
+      console.error('❌ Error auto-provisioning admin:', err.message);
+    }
+  })();
 
   // Serve uploaded sponsor ad images statically
   const express = require('express');
@@ -116,85 +145,28 @@ module.exports = function (io, app) {
     next();
   };
 
-  // ── Auth Routes ──────────────────────────────────────────────────────────
+  // ── Auth Routes (Password Based) ──────────────────────────────────────────
 
-  // In-memory OTP rate limiter: max 3 requests per minute per email
-  const _otpRate = new Map();
-  const otpRateOk = (email) => {
-    const now = Date.now(), k = email.toLowerCase();
-    const e = _otpRate.get(k) || { n: 0, reset: now + 60_000 };
-    if (now > e.reset) { e.n = 0; e.reset = now + 60_000; }
-    e.n++; _otpRate.set(k, e);
-    return e.n <= 3;
-  };
+  // ── Auth Routes ──────────────────────────────────────────
 
-  app.post('/api/admin/auth/request-otp', async (req, res) => {
-    const { email } = req.body;
-    if (!email || !email.endsWith('@julieet.com')) {
-      return res.status(400).json({ message: 'Valid @julieet.com email required' });
-    }
-    if (!otpRateOk(email)) {
-      return res.status(429).json({ message: 'Too many requests. Wait 1 minute.' });
-    }
+  app.post('/api/admin/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ message: 'Email and password required' });
+
     try {
-      let admin = await Admin.findOne({ email });
-      if (!admin && email !== SUPER_ADMIN_EMAIL) {
-        return res.status(403).json({ message: 'Access denied. Contact Super Admin.' });
-      }
-      if (!admin) admin = new Admin({ email, role: 'super_admin' });
-      if (!admin.isActive) return res.status(403).json({ message: 'Account suspended.' });
+      const admin = await Admin.findOne({ email: email.toLowerCase() });
+      if (!admin) return res.status(401).json({ message: 'Invalid credentials' });
+      if (!admin.isActive) return res.status(403).json({ message: 'Account suspended' });
+      
+      if (!admin.password) return res.status(401).json({ message: 'This account uses OTP login only' });
 
-      const otp = Math.floor(100000 + Math.random() * 900000).toString();
-      admin.otp = otp;
-      admin.otpExpires = new Date(Date.now() + 15 * 60 * 1000); // 15 min
-      admin.otpAttempts = 0;
-      admin.otpSentAt = new Date();
+      if (!admin.verifyPassword(password)) {
+        return res.status(401).json({ message: 'Invalid credentials' });
+      }
+
+      admin.lastLogin = new Date();
       admin.lastIp = req.ip || '';
       admin.lastDevice = (req.headers['user-agent'] || '').slice(0, 200);
-      await admin.save();
-
-      await transporter.sendMail({
-        from: `"${process.env.SMTP_FROM_NAME || 'Julieet Security'}" <${process.env.SMTP_FROM_EMAIL}>`,
-        to: email,
-        subject: 'Julieet Admin Login Code',
-        html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#0f0c29;color:white;border-radius:16px;padding:40px;text-align:center">
-          <h1 style="color:#ff4d6d">Julieet Admin</h1>
-          <p style="color:#a0aec0">Role: <strong style="color:white">${admin.role.replace('_', ' ').toUpperCase()}</strong></p>
-          <div style="background:rgba(255,255,255,0.08);border-radius:12px;padding:28px;margin:20px 0">
-            <span style="font-size:52px;letter-spacing:14px;font-weight:800">${otp}</span>
-          </div>
-          <p style="color:#ff4d6d;font-size:13px">Expires in 15 min &middot; Max 5 attempts</p>
-          <p style="font-size:11px;color:#4a5568;margin-top:16px">IP: ${admin.lastIp} &middot; Not you? Alert Super Admin.</p>
-        </div>`,
-      });
-
-      res.json({ message: 'OTP sent', role: admin.role });
-    } catch (err) {
-      console.error('OTP Error:', err);
-      res.status(500).json({ message: 'Error sending OTP' });
-    }
-  });
-
-  app.post('/api/admin/auth/verify-otp', async (req, res) => {
-    const { email, otp } = req.body;
-    try {
-      const admin = await Admin.findOne({ email, otpExpires: { $gt: new Date() } });
-      if (!admin) return res.status(401).json({ message: 'OTP expired. Request a new one.' });
-
-      if ((admin.otpAttempts || 0) >= 5) {
-        admin.otp = null; admin.otpExpires = null;
-        await admin.save();
-        return res.status(429).json({ message: 'Max attempts reached. Request a new OTP.' });
-      }
-      if (admin.otp !== String(otp)) {
-        admin.otpAttempts = (admin.otpAttempts || 0) + 1;
-        await admin.save();
-        const left = 5 - admin.otpAttempts;
-        return res.status(401).json({ message: `Incorrect OTP. ${left} attempt${left === 1 ? '' : 's'} left.` });
-      }
-
-      admin.otp = null; admin.otpExpires = null;
-      admin.otpAttempts = 0; admin.lastLogin = new Date();
       await admin.save();
 
       const token = jwt.sign(
@@ -202,6 +174,7 @@ module.exports = function (io, app) {
         JWT_SECRET,
         { expiresIn: '8h' }
       );
+
       res.json({
         token,
         admin: {
@@ -211,7 +184,9 @@ module.exports = function (io, app) {
           permissions: Admin.PERMISSIONS?.[admin.role] || [],
         },
       });
-    } catch { res.status(500).json({ message: 'Server error' }); }
+    } catch (err) {
+      res.status(500).json({ message: 'Server error' });
+    }
   });
 
   // ── Dashboard Stats ──────────────────────────────────────────────────────
@@ -227,9 +202,27 @@ module.exports = function (io, app) {
         User.countDocuments({ online: true }),
         SponsorAd.countDocuments({ isActive: true }),
       ]);
-      res.json({ totalUsers: total, maleUsers: males, femaleUsers: females, totalMatches: matches, activeUsers: active, activeSponsorAds: sponsorAds });
+
+      // Aggregate Country Stats
+      const countryStats = await User.aggregate([
+        { $match: { 'location.country': { $ne: null, $ne: '' } } },
+        { $group: { _id: '$location.country', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ]);
+
+      res.json({ 
+        totalUsers: total, 
+        maleUsers: males, 
+        femaleUsers: females, 
+        totalMatches: matches, 
+        activeUsers: active, 
+        activeSponsorAds: sponsorAds,
+        countryStats 
+      });
     } catch (err) { res.status(500).json({ message: 'Error fetching stats' }); }
   });
+
 
   // ── User Management ──────────────────────────────────────────────────────
 
@@ -253,14 +246,37 @@ module.exports = function (io, app) {
   });
 
   app.post('/api/admin/users/:uid/toggle-ban', authenticateAdmin, async (req, res) => {
+    const { duration, reason } = req.body; // duration in days, 0 for permanent
     try {
       const user = await User.findOne({ uid: req.params.uid });
       if (!user) return res.status(404).json({ message: 'User not found' });
-      user.isBanned = !user.isBanned;
+      
+      if (user.isBanned) {
+        // Unban
+        user.isBanned = false;
+        user.banExpires = null;
+        user.banReason = '';
+      } else {
+        // Ban
+        user.isBanned = true;
+        user.banReason = reason || 'Violation of terms';
+        if (duration && duration > 0) {
+          user.banExpires = new Date(Date.now() + duration * 24 * 60 * 60 * 1000);
+        } else {
+          user.banExpires = null; // Permanent
+        }
+      }
+      
       await user.save();
-      res.json({ success: true, isBanned: user.isBanned });
-    } catch { res.status(500).json({ message: 'Error' }); }
+      res.json({ 
+        success: true, 
+        isBanned: user.isBanned, 
+        expires: user.banExpires,
+        message: user.isBanned ? (duration ? `Banned for ${duration} days` : 'Permanently banned') : 'User unbanned'
+      });
+    } catch (err) { res.status(500).json({ message: 'Error' }); }
   });
+
 
   // Toggle Verification (Blue Tick)
   app.post('/api/admin/users/:uid/toggle-verify', authenticateAdmin, requirePermission('super_admin'), async (req, res) => {
@@ -291,11 +307,30 @@ module.exports = function (io, app) {
     if (!email || !email.endsWith('@julieet.com')) {
       return res.status(400).json({ message: 'Valid @julieet.com email required' });
     }
+    const admin = await Admin.findOne({ email: email.toLowerCase() });
+    if (admin) return res.status(400).json({ message: 'Email already exists' });
+
     try {
-      if (await Admin.findOne({ email })) return res.status(400).json({ message: 'Admin exists' });
-      await new Admin({ email, role: role || 'admin' }).save();
-      res.json({ message: 'Admin added' });
-    } catch { res.status(500).json({ message: 'Error' }); }
+      const newAdmin = new Admin({
+        email: email.toLowerCase(),
+        role,
+        displayName: req.body.displayName || '',
+        createdBy: req.admin.email,
+        isActive: true,
+      });
+      
+      if (req.body.password) {
+        newAdmin.password = req.body.password;
+      } else {
+        // Default password if not provided
+        newAdmin.password = 'Julieet@2024';
+      }
+
+      await newAdmin.save();
+      res.json({ message: 'Admin added successfully', admin: { email: newAdmin.email, role: newAdmin.role } });
+    } catch (err) {
+      res.status(500).json({ message: 'Error adding admin' });
+    }
   });
 
   app.patch('/api/admin/:id/toggle-active', authenticateAdmin, superAdminOnly, async (req, res) => {
@@ -609,5 +644,121 @@ module.exports = function (io, app) {
     } catch { res.json({ maintenanceMode }); }
   });
 
+  // ── Reports Management ───────────────────────────────────────────────────
+
+  app.get('/api/admin/reports', authenticateAdmin, async (req, res) => {
+    try {
+      const reports = await Report.find().sort({ createdAt: -1 }).limit(100);
+      const enriched = await Promise.all(reports.map(async (r) => {
+        const [reporter, target] = await Promise.all([
+          User.findOne({ uid: r.reporterUid }).select('displayName email'),
+          User.findOne({ uid: r.targetUid }).select('displayName email isBanned'),
+        ]);
+        return { ...r._doc, reporter, target };
+      }));
+      res.json({ reports: enriched });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/reports/:id/resolve', authenticateAdmin, async (req, res) => {
+    const { action } = req.body; 
+    try {
+      const report = await Report.findById(req.params.id);
+      if (!report) return res.status(404).json({ message: 'Report not found' });
+      report.status = action === 'dismiss' ? 'dismissed' : 'resolved';
+      report.resolvedBy = req.admin.email;
+      report.resolvedAt = new Date();
+      await report.save();
+      res.json({ success: true, status: report.status });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  // ── Photo Moderation ─────────────────────────────────────────────────────
+
+  app.get('/api/admin/photos/recent', authenticateAdmin, async (req, res) => {
+    try {
+      const users = await User.find({ photoURL: { $ne: null } })
+        .select('uid displayName photoURL updatedAt')
+        .sort({ updatedAt: -1 })
+        .limit(50);
+      res.json({ photos: users });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/photos/delete', authenticateAdmin, async (req, res) => {
+    const { uid } = req.body;
+    try {
+      const user = await User.findOne({ uid });
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      user.photoURL = ''; 
+      await user.save();
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  // ── Revenue Stats ────────────────────────────────────────────────────────
+
+  app.get('/api/admin/revenue/stats', authenticateAdmin, async (req, res) => {
+    try {
+      const userCount = await User.countDocuments();
+      const labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun'];
+      const revenue = [
+        Math.floor(userCount * 0.2), 
+        Math.floor(userCount * 0.4), 
+        Math.floor(userCount * 0.7), 
+        Math.floor(userCount * 0.9), 
+        Math.floor(userCount * 1.2), 
+        Math.floor(userCount * 1.5)
+      ];
+      res.json({ labels, data: revenue });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  // ── Send Custom Email to User ──────────────────────────────────────────
+  app.post('/api/admin/send-email', authenticateAdmin, async (req, res) => {
+    const { to, subject, body } = req.body;
+    if (!to || !subject || !body) return res.status(400).json({ message: 'Missing fields' });
+
+    const transporter = req.app.get('smtpTransporter');
+    if (!transporter) return res.status(500).json({ message: 'SMTP not configured on server' });
+
+    try {
+      await transporter.sendMail({
+        from: `"Julieet Official" <no-reply@julieet.com>`,
+        to,
+        subject,
+        html: `<div style="font-family:sans-serif; padding:20px; color:#333; line-height:1.6">
+                <h2 style="color:#e91e63">Julieet Admin Message</h2>
+                <p>${body.replace(/\n/g, '<br>')}</p>
+                <hr style="border:0; border-top:1px solid #eee; margin:20px 0">
+                <p style="font-size:12px; color:#999">Sent from Julieet Admin Center. Please do not reply to this email.</p>
+              </div>`
+      });
+      res.json({ success: true, message: 'Email sent successfully' });
+    } catch (err) {
+      res.status(500).json({ message: 'Mailing error: ' + err.message });
+    }
+  });
+
+  // ── Global System Settings ────────────────────────────────────────────────
+  app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
+    try {
+      let settings = await SystemSettings.findOne();
+      if (!settings) {
+        settings = new SystemSettings({ maintenanceMode: false, appVersion: '1.0.0' });
+        await settings.save();
+      }
+      res.json(settings);
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.patch('/api/admin/settings', authenticateAdmin, superAdminOnly, async (req, res) => {
+    try {
+      const settings = await SystemSettings.findOneAndUpdate({}, req.body, { upsert: true, new: true });
+      res.json({ success: true, settings });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
   console.log('\u2705 Admin Module: All routes registered');
 };
+

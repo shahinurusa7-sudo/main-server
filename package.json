@@ -1,6 +1,6 @@
 {
   "name": "julieet-server",
-  "version": "1.0.0",
+  "version": "1.23.0",
   "description": "Backend server for Love Birds app with Firebase Admin SDK",
   "main": "index.js",
   "scripts": {

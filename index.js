@@ -148,6 +148,9 @@ const smtpTransporter = smtpConfigured
   })
   : null;
 
+app.set('smtpTransporter', smtpTransporter);
+
+
 if (WELCOME_EMAIL_ENABLED) {
   if (smtpConfigured) {
     console.log(`📧 SMTP welcome email enabled (${SMTP_HOST}:${SMTP_PORT})`);
