@@ -13,6 +13,7 @@ const Report = require('./models/Report');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'julieet-admin-secret-key-9988-shahinur';
 const SUPER_ADMIN_EMAIL = 'indxadmincherry@julieet.com';
+const LEGACY_SUPER_ADMIN = 'shahinuralam@julieet.com';
 
 // ─── Email Transporter ───────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -57,26 +58,29 @@ module.exports = function (io, app) {
   // ── Auto-Provision Super Admin ──────────────────────────────────────────
   (async () => {
     try {
-      const mainEmail = 'indxadmincherry@julieet.com';
+      const mainEmails = [SUPER_ADMIN_EMAIL, LEGACY_SUPER_ADMIN];
       const mainPass = 'SC18232005@:)(:&^%';
-      let mainAdmin = await Admin.findOne({ email: mainEmail });
       
-      if (!mainAdmin) {
-        mainAdmin = new Admin({ 
-          email: mainEmail, 
-          role: 'super_admin',
-          displayName: 'Super Admin',
-          isActive: true
-        });
-        mainAdmin.password = mainPass;
-        await mainAdmin.save();
-        console.log('✅ Main Super Admin created with password login.');
-      } else if (!mainAdmin.password) {
-        mainAdmin.password = mainPass;
-        await mainAdmin.save();
-        console.log('✅ Main Super Admin updated with password login.');
+      for (const email of mainEmails) {
+        let admin = await Admin.findOne({ email });
+        if (!admin) {
+          admin = new Admin({ 
+            email, 
+            role: 'super_admin', 
+            displayName: email === SUPER_ADMIN_EMAIL ? 'Julieet Root' : 'Legacy Owner',
+            isActive: true 
+          });
+          admin.password = mainPass;
+          await admin.save();
+          console.log(`✅ Super Admin created: ${email}`);
+        } else if (!admin.password) {
+          admin.password = mainPass;
+          await admin.save();
+          console.log(`✅ Super Admin updated: ${email}`);
+        }
       }
     } catch (err) {
+
       console.error('❌ Error auto-provisioning admin:', err.message);
     }
   })();
@@ -119,7 +123,8 @@ module.exports = function (io, app) {
   // ── Middleware ───────────────────────────────────────────────────────────
 
   const authenticateAdmin = async (req, res, next) => {
-    const token = req.headers.authorization?.split(' ')[1];
+    // Look for token in custom header to avoid conflict with Firebase User tokens
+    const token = req.headers['x-admin-token'] || req.headers.authorization?.split(' ')[1];
     if (!token) return res.status(401).json({ message: 'No token provided' });
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
@@ -127,8 +132,11 @@ module.exports = function (io, app) {
       if (!admin || !admin.isActive) return res.status(403).json({ message: 'Account inactive' });
       req.admin = admin;
       next();
-    } catch { res.status(401).json({ message: 'Invalid or expired token' }); }
+    } catch (err) { 
+      res.status(401).json({ message: 'Token verification failed: ' + err.message }); 
+    }
   };
+
 
   // Check a named permission (uses Admin.PERMISSIONS map + .can() method)
   const requirePermission = (perm) => (req, res, next) => {
@@ -139,11 +147,16 @@ module.exports = function (io, app) {
   };
 
   const superAdminOnly = (req, res, next) => {
-    if (req.admin.role !== 'super_admin' && req.admin.email !== SUPER_ADMIN_EMAIL) {
+    const isSuper = req.admin.role === 'super_admin' || 
+                    req.admin.email === SUPER_ADMIN_EMAIL || 
+                    req.admin.email === LEGACY_SUPER_ADMIN;
+    if (!isSuper) {
       return res.status(403).json({ message: 'Super Admin access required' });
     }
     next();
   };
+
+
 
   // ── Auth Routes (Password Based) ──────────────────────────────────────────
 
@@ -643,6 +656,52 @@ module.exports = function (io, app) {
       res.json({ ...config, maintenanceMode });
     } catch { res.json({ maintenanceMode }); }
   });
+  // ── Sponsor Ads Management ─────────────────────────────────────────────
+  const multer = require('multer');
+  const storage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
+    filename: (req, file, cb) => cb(null, 'ad_' + Date.now() + path.extname(file.originalname))
+  });
+  const upload = multer({ storage });
+
+  app.get('/api/admin/sponsor-ads', authenticateAdmin, async (req, res) => {
+    try {
+      const ads = await SponsorAd.find().sort({ priority: -1, createdAt: -1 });
+      res.json(ads);
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/sponsor-ads', authenticateAdmin, upload.single('image'), async (req, res) => {
+    try {
+      const adData = { ...req.body, uploadedBy: req.admin.email };
+      if (req.file) {
+        adData.imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+        adData.imageFilename = req.file.filename;
+      }
+      
+      const ad = new SponsorAd(adData);
+      await ad.save();
+      res.json({ success: true, ad });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.delete('/api/admin/sponsor-ads/:id', authenticateAdmin, superAdminOnly, async (req, res) => {
+    try {
+      const ad = await SponsorAd.findByIdAndDelete(req.params.id);
+      // Optional: Delete physical file here too
+      res.json({ success: true });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.patch('/api/admin/sponsor-ads/:id/toggle', authenticateAdmin, async (req, res) => {
+    try {
+      const ad = await SponsorAd.findById(req.params.id);
+      if (!ad) return res.status(404).json({ message: 'Ad not found' });
+      ad.isActive = !ad.isActive;
+      await ad.save();
+      res.json({ success: true, isActive: ad.isActive });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
 
   // ── Reports Management ───────────────────────────────────────────────────
 
@@ -740,6 +799,98 @@ module.exports = function (io, app) {
     }
   });
 
+  // ── Reports Management ──────────────────────────────────────────────────
+  const Report = require('./models/Report');
+
+  app.get('/api/admin/reports', authenticateAdmin, async (req, res) => {
+    try {
+      const reports = await Report.aggregate([
+        { $sort: { createdAt: -1 } },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'reporterUid',
+            foreignField: 'uid',
+            as: 'reporter'
+          }
+        },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'targetUid',
+            foreignField: 'uid',
+            as: 'target'
+          }
+        },
+        { $unwind: { path: '$reporter', preserveNullAndEmptyArrays: true } },
+        { $unwind: { path: '$target', preserveNullAndEmptyArrays: true } }
+      ]);
+      res.json({ reports });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/reports/:id/resolve', authenticateAdmin, async (req, res) => {
+    const { action } = req.body; // 'resolved' or 'dismissed'
+    try {
+      const report = await Report.findById(req.params.id);
+      if (!report) return res.status(404).json({ message: 'Report not found' });
+      
+      report.status = action || 'resolved';
+      report.resolvedBy = req.admin.email;
+      report.resolvedAt = new Date();
+      await report.save();
+      
+      res.json({ success: true, message: `Report ${report.status}` });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  // ── Photo Moderation ────────────────────────────────────────────────────
+  app.get('/api/admin/photos', authenticateAdmin, async (req, res) => {
+    try {
+      // Get users who have photos, sorted by recent activity
+      const users = await User.find({ 
+        $or: [
+          { photoURL: { $ne: '', $ne: null } }, 
+          { photos: { $not: { $size: 0 } } }
+        ] 
+      })
+      .select('uid displayName photoURL photos updatedAt')
+      .sort({ updatedAt: -1 })
+      .limit(50)
+      .lean();
+
+      // Flatten into a list of photo objects
+      const allPhotos = [];
+      users.forEach(u => {
+        if (u.photoURL) allPhotos.push({ url: u.photoURL, uid: u.uid, name: u.displayName, isMain: true });
+        if (u.photos) {
+          u.photos.forEach(p => {
+            if (p !== u.photoURL) allPhotos.push({ url: p, uid: u.uid, name: u.displayName, isMain: false });
+          });
+        }
+      });
+
+      res.json({ photos: allPhotos });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/photos/delete', authenticateAdmin, async (req, res) => {
+    const { uid, url } = req.body;
+    try {
+      const user = await User.findOne({ uid });
+      if (!user) return res.status(404).json({ message: 'User not found' });
+
+      // Remove from main photo if match
+      if (user.photoURL === url) user.photoURL = '';
+      
+      // Remove from gallery
+      user.photos = user.photos.filter(p => p !== url);
+      
+      await user.save();
+      res.json({ success: true, message: 'Photo removed successfully' });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
   // ── Global System Settings ────────────────────────────────────────────────
   app.get('/api/admin/settings', authenticateAdmin, async (req, res) => {
     try {
@@ -758,6 +909,51 @@ module.exports = function (io, app) {
       res.json({ success: true, settings });
     } catch (err) { res.status(500).json({ message: err.message }); }
   });
+
+  // ── Push Notifications ──────────────────────────────────────────────────
+  const push = require('./push-notification');
+
+  app.post('/api/admin/notify-user/:uid', authenticateAdmin, async (req, res) => {
+    const { title, body } = req.body;
+    if (!title || !body) return res.status(400).json({ message: 'Title and body required' });
+
+    try {
+      const success = await push.toUser(req.params.uid, { title, body, data: { type: 'admin_broadcast' } });
+      if (success) {
+        res.json({ success: true, message: 'Notification sent' });
+      } else {
+        res.status(400).json({ message: 'User has no valid FCM tokens or is offline' });
+      }
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
+  app.post('/api/admin/notify-all', authenticateAdmin, requirePermission('super_admin'), async (req, res) => {
+    const { target, title, body } = req.body; // target: 'all', 'male', 'female'
+    if (!title || !body) return res.status(400).json({ message: 'Title and body required' });
+
+    try {
+      let query = {};
+      if (target === 'male') query.gender = 'male';
+      if (target === 'female') query.gender = 'female';
+
+      const users = await User.find(query).select('uid').lean();
+      
+      // Send asynchronously in background to avoid blocking the request
+      (async () => {
+        let sentCount = 0;
+        for (const u of users) {
+          try {
+            await push.toUser(u.uid, { title, body, data: { type: 'admin_broadcast' } });
+            sentCount++;
+          } catch (_) {}
+        }
+        console.log(`📢 [Admin] Broadcast complete: Sent to ${sentCount} users.`);
+      })();
+
+      res.json({ success: true, message: `Broadcast started to ${users.length} users` });
+    } catch (err) { res.status(500).json({ message: err.message }); }
+  });
+
 
   console.log('\u2705 Admin Module: All routes registered');
 };
